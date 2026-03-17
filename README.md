@@ -23,11 +23,11 @@ Perfect for high-volume installations (e.g. 500k+ emails/day) on servers with fa
 ## Installation
 
 ```text
-1. Copy the plugin folder into `plugins/`:
-```
+1. Copy the plugin folder into `plugins/` as `FileSystemQueueBundle`:
+
 plugins/
- └── FileSystemQueueBundle/
-```text
+   └── FileSystemQueueBundle/
+
 2. Log in to Mautic admin → **Settings → Plugins**  
    → Click **Install/Upgrade Plugins**  
    → The bundle should appear → install it
