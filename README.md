@@ -52,9 +52,9 @@ Alternative: Configure via UI (if scheme appears after tagging)
 
 1. Go to Configuration → Queue Settings
 2. For each queue (Email, Hit, Failed):
-* Scheme: filesystem (if visible) or manually type filesystem://
+* Scheme: filesystem
 * Host: default
-* Path: /var/queue/email (or /hit, /failed, etc.)
+* Path: email (or hit, failed, etc.)
 3. Save
 
 If filesystem does not appear in dropdown → use config override above.
