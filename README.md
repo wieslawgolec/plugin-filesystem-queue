@@ -88,8 +88,6 @@ php bin/console messenger:consume email -vvv
 php bin/console messenger:consume email --benchmark --limit=500
 ```
 The **--benchmark** flag is especially useful when tuning **--limit**, **--time-limit** or comparing different storage locations / SSDs.
-## Monitoring
-Queue size (ready mes
 
 ## Monitoring
 
