@@ -64,28 +64,34 @@ If filesystem does not appear in dropdown → use config override above.
 Add to cron (recommended: separate processes for each queue type)
 ```Bash
 # Email queue - high volume
-* * * * * php /path/to/mautic/bin/console messenger:consume email --no-interaction --limit=100 --time-limit=300 --memory-limit=512M
+* * * * * php /path/to/mautic/bin/console mautic:queue:consume email --no-interaction --limit=100 --time-limit=300 --memory-limit=512M
 
 # Hit queue - lighter load
-* * * * * php /path/to/mautic/bin/console messenger:consume hit --no-interaction --limit=200 --time-limit=120
+* * * * * php /path/to/mautic/bin/console mautic:queue:consume hit --no-interaction --limit=200 --time-limit=120
 
 # Failed queue - occasional retries
-* * * * * php /path/to/mautic/bin/console messenger:consume failed --no-interaction --limit=50 --time-limit=300
+* * * * * php /path/to/mautic/bin/console mautic:queue:consume failed --no-interaction --limit=50 --time-limit=300
 ```
 Use **supervisor** or **systemd** for production (better than cron).
 ## Useful command flags
 ```Bash
-# Show basic progress & errors
-php bin/console messenger:consume email -v
+# Show basic progress & errors for email queue
+php bin/console mautic:emails:send -v
 
-# More detailed – shows each message being handled
-php bin/console messenger:consume email -vv
+# More detailed – shows each message being handled for hits queue
+php bin/console mautic:emails:send -vv
 
 # Very verbose – full debug + message content (careful in production!)
-php bin/console messenger:consume email -vvv
+php bin/console mautic:emails:send -vvv
 
 # Measure real performance (messages/sec, total time, memory peak, etc.)
-php bin/console messenger:consume email --benchmark --limit=500
+php bin/console mautic:emails:send --benchmark --limit=500
+
+# Consume hits messages & measure real performance (messages/sec, total time, memory peak, etc.)
+php bin/console mautic:hits:consume --benchmark
+
+# Consume falied messages & exit when done or memory use above 128M
+php bin/console mautic:falied:consume --memory-limit=128M
 ```
 The **--benchmark** flag is especially useful when tuning **--limit**, **--time-limit** or comparing different storage locations / SSDs.
 
