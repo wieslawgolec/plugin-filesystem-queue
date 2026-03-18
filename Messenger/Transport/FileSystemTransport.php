@@ -27,13 +27,6 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     ) {
         $this->directory = rtrim($directory, '/');
 
-        /*
-         * No need to check 2 times. its already checked in Factory class
-        if (!is_dir($this->directory) && !mkdir($this->directory, 0775, true)) {
-            throw new TransportException("Cannot create directory: {$this->directory}");
-        }
-        */
-        
         $this->serializer = $serializer ?? new PhpSerializer();
     }
 
@@ -98,7 +91,13 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             return [];
         }
 
-        usort($files, static fn($a, $b) => basename($a) <=> basename($b));
+        $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
+        if($autoShuffle) {
+            shuffle($files);
+        } else {
+            // Sort by modification time - oldest first
+            usort($files, static fn($a, $b) => basename($a) <=> basename($b));
+        }
 
         $envelopes = [];
 
@@ -238,9 +237,14 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             return [];
         }
 
-        // Sort by modification time - oldest first
-        usort($files, static fn($a, $b) => basename($a) <=> basename($b));
-
+        $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
+        if($autoShuffle) {
+            shuffle($files);
+        } else {
+            // Sort by modification time - oldest first
+            usort($files, static fn($a, $b) => basename($a) <=> basename($b));
+        }
+        
         $count = 0;
         foreach ($files as $filename) {
             if ($limit !== null && $count >= $limit) {
