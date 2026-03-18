@@ -33,18 +33,18 @@ class ConsumeQueueCommand extends ModeratedCommand
     private int $processedSinceLastAck = 0;
     private int $lastAckTime = 0;
 
-    private const DEFAULT_ACK_BATCH_SIZE   = 100;
-    private const MAX_ACK_BATCH_SIZE       = 1000;
-    private const ACK_MAX_AGE_SECONDS      = 60;
+    public const DEFAULT_ACK_BATCH_SIZE   = 100;
+    public const MAX_ACK_BATCH_SIZE       = 1000;
+    public const ACK_MAX_AGE_SECONDS      = 60;
 
     private array $acks = [];
 
-    private const QUEUE_ALL     = 'all';
-    private const QUEUE_EMAIL   = 'email';
-    private const QUEUE_HIT     = 'hit';
-    private const QUEUE_FAILED  = 'failed';
+    public const QUEUE_ALL     = 'all';
+    public const QUEUE_EMAIL   = 'email';
+    public const QUEUE_HIT     = 'hit';
+    public const QUEUE_FAILED  = 'failed';
 
-    private const ALIAS_TO_QUEUE = [
+    public const ALIAS_TO_QUEUE = [
         'mautic:emails:send'     => self::QUEUE_EMAIL,
         'mautic:emails:consume'  => self::QUEUE_EMAIL,
         'mautic:hits:consume'    => self::QUEUE_HIT,
