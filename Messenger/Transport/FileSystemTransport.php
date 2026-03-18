@@ -30,6 +30,16 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         $this->serializer = $serializer ?? new PhpSerializer();
     }
 
+    public function getDirectory(): string
+    {
+        return $this->directory;
+    }
+    
+    public function getSerializer(): SerializerInterface 
+    {
+        return $this->serializer;
+    }    
+
     public function send(Envelope $envelope): Envelope
     {
         $id = $this->generateUniqueId();
@@ -119,7 +129,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     /**
      * Try to process one file with retry protection
      */
-    private function tryProcessFile(string $filename): ?Envelope
+    public function tryProcessFile(string $filename): ?Envelope
     {
         $envelope = null;
 
@@ -171,7 +181,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     /**
      * Retry helper for transient file operations, using Messenger retry strategy parameters
      */
-    private function withFileRetry(callable $operation, string $context = 'operation'): void
+   public function withFileRetry(callable $operation, string $context = 'operation'): void
     {
         // Read current strategy from config (exactly your parameters)
         $maxRetries   = max(0, (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_max_retries', 3));
@@ -212,7 +222,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     /**
      * Decide if error is worth retrying (filesystem transient errors)
      */
-    private function isRetryableFileError(\Throwable $e): bool
+    public function isRetryableFileError(\Throwable $e): bool
     {
         $msg = $e->getMessage();
 
@@ -317,7 +327,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     /**
      * Recover stuck .processing files based on retry strategy settings
      */
-    private function recoverStuckProcessingFiles(): void
+    public function recoverStuckProcessingFiles(): void
     {
         $delaySeconds = $this->coreParametersHelper->get(
             'mautic.messenger_retry_strategy_delay',
@@ -357,7 +367,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             + ($processingFiles === false ? 0 : count($processingFiles));
     }
 
-    private function getFileForEnvelope(Envelope $envelope, string $extension = self::MESSAGE_EXTENSION): ?string
+    public function getFileForEnvelope(Envelope $envelope, string $extension = self::MESSAGE_EXTENSION): ?string
     {
         $stamp = $envelope->last(TransportMessageIdStamp::class);
         if (!$stamp instanceof TransportMessageIdStamp) {
@@ -368,7 +378,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         return file_exists($filename) ? $filename : null;
     }
 
-    private function generateUniqueId(): string
+    public function generateUniqueId(): string
     {
         do {
             $id = uniqid(date('Ymd_His_') . gettimeofday()['usec'], true);
@@ -378,12 +388,12 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         return $id;
     }
 
-    private function generateFilenameById(string $id, string $extension = self::MESSAGE_EXTENSION): string
+    public function generateFilenameById(string $id, string $extension = self::MESSAGE_EXTENSION): string
     {
         return $this->directory . '/' . $id . $extension;
     }
 
-    private function getProcessingFilename(string $originalFilename): string
+    public function getProcessingFilename(string $originalFilename): string
     {
         return str_replace(self::MESSAGE_EXTENSION, self::PROCESSING_EXTENSION, $originalFilename);
     }
