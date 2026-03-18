@@ -8,6 +8,7 @@ return [
     'author'      => 'Wieslaw Golec',
     'parameters' => [
         'filesystem_queue_batch_size' => 1,
+        'filesystem_queue_batch_auto_shuffle' => true,
         'filesystem_queue_msg_limit' => null,
         'filesystem_queue_time_limit' => null,
         'filesystem_queue_email_msg_limit' => null,
