@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use MauticPlugin\FileSystemQueueBundle\Command\ConsumeQueueCommand;
+use MauticPlugin\FileSystemQueueBundle\Command\AdvancedEmailSendCommand;
 use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransportFactory;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\DependencyInjection\Reference;
@@ -23,4 +24,10 @@ return static function (ContainerConfigurator $configurator): void {
         ->arg('$hitTransport',    service('messenger.transport.hit')->nullOnInvalid())
         ->arg('$failedTransport', service('messenger.transport.failed')->nullOnInvalid())
         ->tag('console.command');
+
+    $services->set(AdvancedEmailSendCommand::class)
+        ->arg('$bus', new Reference('messenger.default_bus'))
+        ->arg('$eventDispatcher', service('event_dispatcher')->nullOnInvalid())
+        ->arg('$emailTransport',  service('messenger.transport.email')->nullOnInvalid())
+        ->tag('console.command');    
 };
