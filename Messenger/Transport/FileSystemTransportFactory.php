@@ -28,6 +28,16 @@ class FileSystemTransportFactory implements TransportFactoryInterface
         $this->projectDir = $kernel->getProjectDir() . self::QUEUE_DIR;
     }
 
+    public function getProjectDir(): string
+    {
+        return $this->projectDir;
+    }
+    
+    public function getSerializer(): SerializerInterface 
+    {
+        return $this->serializer;
+    }
+
     public function createTransport(string $dsn, array $options, SerializerInterface $serializer): TransportInterface
     {
         if (!str_starts_with($dsn, 'filesystem://')) {
