@@ -27,10 +27,13 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     ) {
         $this->directory = rtrim($directory, '/');
 
+        /*
+         * No need to check 2 times. its already checked in Factory class
         if (!is_dir($this->directory) && !mkdir($this->directory, 0775, true)) {
             throw new TransportException("Cannot create directory: {$this->directory}");
         }
-
+        */
+        
         $this->serializer = $serializer ?? new PhpSerializer();
     }
 
@@ -95,7 +98,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             return [];
         }
 
-        usort($files, static fn($a, $b) => filemtime($a) <=> filemtime($b));
+        usort($files, static fn($a, $b) => basename($a) <=> basename($b));
 
         $envelopes = [];
 
@@ -236,7 +239,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         }
 
         // Sort by modification time - oldest first
-        usort($files, static fn($a, $b) => filemtime($a) <=> filemtime($b));
+        usort($files, static fn($a, $b) => basename($a) <=> basename($b));
 
         $count = 0;
         foreach ($files as $filename) {
