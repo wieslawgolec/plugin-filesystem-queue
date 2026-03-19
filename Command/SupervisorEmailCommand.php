@@ -257,7 +257,7 @@ EOT
             '--thread', (string) $threadId,
             '--max-threads', (string) $settings['max_threads'],
             '--lock-name', sprintf(self::QUEUE_EMAIL_THREAD_LOCK.'-%d', $threadId),
-            '--max-messages-per-thread', (string) $messagesPerThread,
+            '--message-limit', (string) $messagesPerThread,
             '--time-limit', (string) $settings['time_limit'],
             '--memory-limit', $settings['memory_limit'],
         ];
