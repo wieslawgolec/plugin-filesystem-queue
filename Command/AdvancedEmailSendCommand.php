@@ -20,11 +20,12 @@ use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransport;
 use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransportFactory;
 use Symfony\Component\HttpKernel\KernelInterface;
-use Symfony\Component\Serializer\SerializerInterface;
+use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Finder\Finder;
 
 #[AsCommand(
     name: 'mautic:emails:advanced-send',
@@ -57,12 +58,20 @@ class AdvancedEmailSendCommand extends ModeratedCommand
         ?SerializerInterface $serializer = null,
     ) {
         parent::__construct($pathsHelper, $coreParametersHelper);
-        $this->queueDirectory = $kernel->getProjectDir() . FileSystemTransportFactory::QUEUE_DIR;
         $this->serializer = $serializer ?? new PhpSerializer();
+        $this->queueDirectory = $kernel->getProjectDir() . FileSystemTransportFactory::QUEUE_DIR;
+        $dsn = $this->coreParametersHelper->get('mautic.messenger_dsn_email');
+
+        if (str_starts_with($dsn, FileSystemTransportFactory::FILESYSTEM_DSN)) {
+            $path = parse_url($dsn, PHP_URL_PATH) ?? '';
+            $this->queueDirectory = rtrim($this->queueDirectory . $path, '/');
+        }
     }
 
     protected function configure(): void
     {
+        parent::configure();
+
         $this
             ->addOption('--message-limit', null, InputOption::VALUE_OPTIONAL, 'Global max messages to process (across all threads)')
             ->addOption('--time-limit', null, InputOption::VALUE_OPTIONAL, 'Max seconds to run')
@@ -112,6 +121,9 @@ EOT
         if (!$this->checkRunStatus($input, $output, $lockName)) {
             return Command::SUCCESS;
         }
+
+        // ← Add recovery here — only the thread that acquired the lock does it
+        $this->recoverStuckProcessingFiles($output);
 
         $globalMsgLimit = (int) ($input->getOption('message-limit') ?: $this->coreParametersHelper->get('mautic.filesystem_queue_email_msg_limit') ?? 0);
         $timeLimit      = (int) ($input->getOption('time-limit')   ?: $this->coreParametersHelper->get('mautic.filesystem_queue_email_time_limit') ?? 0);
@@ -210,9 +222,10 @@ EOT
             if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
             if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
 
-            $filename = $transport->generateFilenameById($id);
+            $filename = $transport->generateFilenameById($id); // .message file
 
-            if (!$this->tryClaimFile($transport, $filename)) {
+            $lockedFp = $this->tryClaimFile($transport, $filename);
+            if ($lockedFp === false) {
                 if ($output->isVerbose()) {
                     $output->writeln("<comment>Already claimed or missing: $id</comment>");
                 }
@@ -222,15 +235,26 @@ EOT
             $processingFile = $transport->getProcessingFilename($filename);
 
             $envelope = $this->loadEnvelopeFromFile($processingFile, $id);
-            if (!$envelope) continue;
+            if (!$envelope) {
+                // load failed → immediate cleanup + delete file
+                if (is_resource($lockedFp)) {
+                    @flock($lockedFp, LOCK_UN);
+                    @fclose($lockedFp);
+                }
+
+                // we leave processing file there. it will be recovered to try again later
+                continue;
+            }
 
             try {
                 $processed++;
-                $this->handleMessage($envelope, $output);
+                $this->handleMessage($envelope, $output, $lockedFp);
             } catch (\Throwable $e) {
                 if ($output->isVerbose()) {
                     $output->writeln("<error>$id failed: {$e->getMessage()}</error>");
                 }
+                // Still add to acks so reject + unlock happens in ackAll
+                $this->acks[] = [$envelope, $e, $lockedFp];
             }
 
             if(($processed > $ackBatchSize && $this->processedSinceLastAck > 0) ||
@@ -315,32 +339,128 @@ EOT
             return [];
         }
 
-        $files = scandir($this->queueDirectory);
-        $ids   = [];
+        $finder = Finder::create()
+            ->in($this->queueDirectory)
+            ->name('*' . FileSystemTransport::MESSAGE_EXTENSION)
+            ->sortByName();   // oldest first (like transport when !autoShuffle)
 
-        $ext = FileSystemTransport::MESSAGE_EXTENSION;
+        $ids = [];
 
-        foreach ($files as $file) {
-            if (str_ends_with($file, $ext)) {
-                $ids[] = substr($file, 0, -strlen($ext));
-            }
+        foreach ($finder as $fileInfo) {
+            try {
+                $id = $fileInfo->getBasename(FileSystemTransport::MESSAGE_EXTENSION);
+                $ids[] = $id;
 
-            if($maxLoad > 0 && count($ids) >= $maxLoad) {
-                break;
+                if ($maxLoad > 0 && count($ids) >= $maxLoad) {
+                    break;
+                }
+            } catch (\Throwable) {
+                // ignore
             }
         }
 
         return $ids;
     }
 
-    private function tryClaimFile(FileSystemTransport $transport, string $filename): bool
+    /**
+     * Recover stuck .processing files — similar logic as FileSystemTransport
+     */
+    private function recoverStuckProcessingFiles(OutputInterface $output): void
+    {
+        $timeout = (int) $this->coreParametersHelper->get(
+            'mautic.messenger_retry_strategy_delay',
+            2700  // 45 min
+        );
+
+        $maxRetries = (int) $this->coreParametersHelper->get(
+            'mautic.messenger_retry_strategy_max_retries',
+            0     // 0 = delete, >0 = put back to queue
+        );
+
+        if ($timeout <= 0) {
+            return; // feature disabled
+        }
+
+        $finder = Finder::create()
+            ->in($this->queueDirectory)
+            ->name([
+                '*' . FileSystemTransport::MESSAGE_EXTENSION,
+                '*' . FileSystemTransport::TRYAGAIN_EXTENSION
+            ])
+            ->date('before ' . $timeout . ' seconds ago');
+
+        $recovered = 0;
+        foreach ($finder as $fileInfo) {
+            $file = $fileInfo->getRealPath();
+
+            try {
+                $fp = null;
+
+                if ($file === false || !file_exists($file)) {
+                    continue;
+                }
+
+                $ctime = filectime($file);
+
+                // Double-check age after getting ctime
+                if ((time() - $ctime) <= $timeout) {
+                    continue;
+                }
+
+                $fp = @fopen($file, 'r+');
+                if ($fp === false) {
+                    continue;
+                }
+
+                if (!flock($fp, LOCK_EX | LOCK_NB)) {
+                    throw new TransportException('Failed to lock file');
+                }
+
+                // Re-check age after acquiring lock (race condition protection)
+                clearstatcache(true, $file);
+                $ctime = filectime($file);
+                if ((time() - $ctime) <= $timeout) {
+                    throw new TransportException('File not match recovery time criteria');
+                }
+
+                // Decide action
+                $originalFile = str_replace(
+                    FileSystemTransport::PROCESSING_EXTENSION,
+                    FileSystemTransport::MESSAGE_EXTENSION,
+                    $file
+                );
+
+                if ($maxRetries > 0) {
+                    // Put back to queue for retry
+                    @rename($file, $originalFile);
+                    $recovered++;
+                } else {
+                    // Delete permanently
+                    @unlink($file);
+                }
+            } catch(\Throwable) {
+                if (is_resource($fp)) {
+                    @flock($fp, LOCK_UN);
+                    @fclose($fp);
+                }
+            }
+        }
+
+        if (!$output->isQuiet() && $recovered > 0) {
+            $output->writeln('<comment>'.$recovered.' stuck .processing file'.($recovered == 1 ? '' : 's').' recovered.</comment>');
+        }
+    }
+
+    private function tryClaimFile(FileSystemTransport $transport, string $filename): mixed // resource|false
     {
         if (!file_exists($filename)) {
             return false;
         }
 
+        $fp = null;
+
         try {
-            $transport->withFileRetry(function () use ($filename) {
+            $transport->withFileRetry(function () use ($filename, &$fp) {
                 $fp = @fopen($filename, 'r');
                 if ($fp === false) {
                     throw new TransportException("Cannot open $filename");
@@ -359,34 +479,38 @@ EOT
                 if (!@rename($filename, $processing)) {
                     throw new TransportException("Rename failed: $filename → $processing");
                 }
-
-                flock($fp, LOCK_UN);
-                fclose($fp);
+                // ← IMPORTANT: DO NOT unlock or fclose here any more!
+                // We keep the lock until after ack/reject.
             }, 'advanced-claim');
 
-            return true;
+            return $fp; // locked file handle (still valid after rename)
         } catch (TransportException) {
+            // Cleanup only on failure (fp may still point to original file)
+            if (is_resource($fp)) {
+                @flock($fp, LOCK_UN);
+                @fclose($fp);
+            }
             return false;
         }
     }
 
     private function loadEnvelopeFromFile(string $filename, string $id): ?Envelope
     {
-        if (!file_exists($filename)) {
-            return null;
-        }
-
-        $content = @file_get_contents($filename);
-        if ($content === false) {
-            return null;
-        }
-
-        $data = json_decode($content, true);
-        if (!is_array($data)) {
-            return null; // or log invalid JSON
-        }
-
         try {
+            if (!file_exists($filename)) {
+                return null;
+            }
+
+            $content = @file_get_contents($filename);
+            if ($content === false) {
+                return null;
+            }
+
+            $data = json_decode($content, true);
+            if (!is_array($data)) {
+                return null; // or log invalid JSON
+            }
+
             $envelope = $this->serializer->decode($data);
             return $envelope->with(new TransportMessageIdStamp($id));
         } catch (\Throwable) {
@@ -410,13 +534,15 @@ EOT
         return str_starts_with((string) $dsn, 'sync');
     }
 
-    private function handleMessage(Envelope $envelope, OutputInterface $output): void
+    private function handleMessage(Envelope $envelope, OutputInterface $output, mixed $fp = null): void
     {
         $event = new WorkerMessageReceivedEvent($envelope, self::QUEUE_EMAIL);
         $this->eventDispatcher?->dispatch($event);
 
         if (!$event->shouldHandle()) {
             $output->writeln('<comment>Message skipped by event listener.</comment>');
+            // still store fp so it gets unlocked below
+            $this->acks[] = [$envelope, null, $fp];
             return;
         }
 
@@ -426,13 +552,13 @@ EOT
             new ReceivedStamp(self::QUEUE_EMAIL)
         ));
 
-        $this->acks[] = [$envelope, null];
+        $this->acks[] = [$envelope, null, $fp];   // ← fp is stored with the ack
         $this->processedSinceLastAck++;
     }
 
     private function ackAll(TransportInterface $transport): void
     {
-        foreach ($this->acks as [$envelope, $exception]) {
+        foreach ($this->acks as [$envelope, $exception, $fp]) {
             try {
                 if ($exception) {
                     $transport->reject($envelope);
@@ -441,6 +567,12 @@ EOT
                 }
             } catch (\Throwable) {
                 // silent fail
+            }
+
+            // ← ALWAYS unlock and close the handle after ack/reject
+            if (is_resource($fp)) {
+                @flock($fp, LOCK_UN);
+                @fclose($fp);
             }
         }
 
