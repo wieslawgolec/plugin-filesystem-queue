@@ -78,6 +78,7 @@ class AdvancedEmailSendCommand extends ModeratedCommand
             ->addOption('--memory-limit', null, InputOption::VALUE_REQUIRED, 'Stop when memory exceeds this (e.g. 256M)')
             ->addOption('--thread', null, InputOption::VALUE_REQUIRED, 'This thread number (1-based)', '1')
             ->addOption('--max-threads', null, InputOption::VALUE_REQUIRED, 'Total threads (pagination parts)', '1')
+            ->addOption('--lock-name', null, InputOption::VALUE_OPTIONAL, 'Custom lock (override auto-generated lock name')
             ->addOption('--max-messages-per-thread', null, InputOption::VALUE_REQUIRED, 'Max messages this thread should process', (string) self::MAX_MESSAGES_PER_THREAD)
             ->addOption('--benchmark', null, InputOption::VALUE_NONE, 'Show performance stats')
             ->setHelp(<<<'EOT'
@@ -115,8 +116,9 @@ EOT
             }
             return Command::SUCCESS;
         }
-
-        $lockName = sprintf('mautic-queue-email-thread-%d-of-%d', $thread, $maxThreads);
+        
+        // Thread based lock (unless --lock-name was forced)
+        $lockName = $input->getOption('lock-name') ?: sprintf('mautic-queue-email-thread-%d-of-%d', $thread, $maxThreads);
 
         if (!$this->checkRunStatus($input, $output, $lockName)) {
             return Command::SUCCESS;
