@@ -4,16 +4,18 @@ namespace MauticPlugin\FileSystemQueueBundle\Messenger\Transport;
 
 use Mautic\CoreBundle\Helper\CoreParametersHelper;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Finder\Finder;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
-use \Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
 class FileSystemTransport implements ListableReceiverInterface,TransportInterface, MessageCountAwareInterface
 {
+    public const TRYAGAIN_EXTENSION   = '.tryagain';
     public const MESSAGE_EXTENSION    = '.message';
     public const PROCESSING_EXTENSION = '.processing';
 
@@ -147,27 +149,33 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
                 $processingFile = $this->getProcessingFilename($filename);
 
                 if (!@rename($filename, $processingFile)) {
+                    flock($fp, LOCK_UN);
+                    fclose($fp);
                     throw new TransportException("Rename failed: $filename → $processingFile");
                 }
 
-                flock($fp, LOCK_UN);
-                fclose($fp);
-
                 $content = file_get_contents($processingFile);
                 if ($content === false) {
+                    flock($fp, LOCK_UN);
+                    fclose($fp);
                     throw new TransportException("Read failed: $processingFile");
                 }
 
                 $data = json_decode($content, true);
                 if ($data === null || $data === false) {
+                    flock($fp, LOCK_UN);
+                    fclose($fp);
                     throw new TransportException("Invalid JSON: $processingFile");
                 }
 
                 $decoded = $this->serializer->decode($data);
                 $id = basename($filename, self::MESSAGE_EXTENSION);
                 $envelope = $decoded->with(new TransportMessageIdStamp($id));
+
+                flock($fp, LOCK_UN);
+                fclose($fp);
             }, 'get/process file');
-        } catch (TransportException $e) {
+        } catch (TransportException) {
             // All retryable failures end up here
             return null;
         } catch (\Throwable $e) {
@@ -235,7 +243,6 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             $e instanceof \ErrorException && str_contains($msg, 'fopen') && str_contains($msg, 'failed');
     }
 
-
     /**
      * Returns all ready messages (up to limit) as Envelopes with stamps.
      */
@@ -295,7 +302,7 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             return null;
         }
 
-        $filename = $this->generateFilenameById($id, self::MESSAGE_EXTENSION);
+        $filename = $this->generateFilenameById($id);
 
         if (!file_exists($filename)) {
             // Also check if it's currently processing
@@ -329,9 +336,9 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
      */
     public function recoverStuckProcessingFiles(): void
     {
-        $delaySeconds = $this->coreParametersHelper->get(
+        $timeout = $this->coreParametersHelper->get(
             'mautic.messenger_retry_strategy_delay',
-            300  // default 5 minutes if not set
+            2700  // default 45 hour
         );
 
         $maxRetries = $this->coreParametersHelper->get(
@@ -339,21 +346,54 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             0   // default 0 = no retry → delete
         );
 
-        $finder = \Symfony\Component\Finder\Finder::create()
+        $finder = Finder::create()
             ->in($this->directory)
-            ->name('*' . self::PROCESSING_EXTENSION)
-            ->date('before ' . $delaySeconds . ' seconds ago');
+            ->name([
+                '*' . FileSystemTransport::MESSAGE_EXTENSION,
+                '*' . FileSystemTransport::TRYAGAIN_EXTENSION
+            ])
+            ->date('before ' . $timeout . ' seconds ago');
 
         foreach ($finder as $fileInfo) {
-            $processingFile = $fileInfo->getRealPath();
-            $originalFile   = str_replace(self::PROCESSING_EXTENSION, self::MESSAGE_EXTENSION, $processingFile);
+            $file = $fileInfo->getRealPath();
+
+            $lockedtime = filectime($file);
+            if ((time() - $lockedtime) <= $timeout) {
+                // Not old enough
+                continue;
+            }
+
+            $fp = @fopen($file, 'r+');
+            if (!$fp) {
+                continue;
+            }
+
+            if (!flock($fp, LOCK_EX | LOCK_NB)) {
+                fclose($fp);
+                continue;
+            }
+
+            // Re-check time after lock
+            $lockedtime = filectime($file);
+            if ((time() - $lockedtime) <= $timeout) {
+                flock($fp, LOCK_UN);
+                fclose($fp);
+                continue;
+            }
 
             if ($maxRetries > 0) {
+                // Rename to .message
+                $originalFile = str_replace(
+                    [ FileSystemTransport::PROCESSING_EXTENSION, self::TRYAGAIN_EXTENSION ],
+                    [ FileSystemTransport::MESSAGE_EXTENSION, FileSystemTransport::MESSAGE_EXTENSION ],
+                    $file
+                );
+
                 // Retry allowed → put back to queue
-                @rename($processingFile, $originalFile);
+                @rename($file, $originalFile);
             } else {
                 // No retry → delete
-                @unlink($processingFile);
+                @unlink($file);
             }
         }
     }
