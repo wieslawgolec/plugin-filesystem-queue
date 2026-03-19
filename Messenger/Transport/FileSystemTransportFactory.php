@@ -13,6 +13,7 @@ use Symfony\Component\HttpKernel\KernelInterface;
 
 class FileSystemTransportFactory implements TransportFactoryInterface
 {
+    public const FILESYSTEM_DSN = 'filesystem://';
     public const QUEUE_DIR = '/var/queue';
     private string $projectDir;
 
@@ -40,7 +41,7 @@ class FileSystemTransportFactory implements TransportFactoryInterface
 
     public function createTransport(string $dsn, array $options, SerializerInterface $serializer): TransportInterface
     {
-        if (!str_starts_with($dsn, 'filesystem://')) {
+        if (!str_starts_with($dsn, self::FILESYSTEM_DSN)) {
             throw new \InvalidArgumentException('Unsupported DSN');
         }
 
@@ -56,6 +57,6 @@ class FileSystemTransportFactory implements TransportFactoryInterface
 
     public function supports(string $dsn, array $options): bool
     {
-        return str_starts_with($dsn, 'filesystem://');
+        return str_starts_with($dsn, self::FILESYSTEM_DSN);
     }
 }
