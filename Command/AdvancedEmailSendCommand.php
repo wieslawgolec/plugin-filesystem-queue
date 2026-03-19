@@ -16,13 +16,15 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
-use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransport;
 use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransportFactory;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\Serializer\SerializerInterface;
-use Symfony\Component\Messenger\Serializer\PhpSerializer;
+use Symfony\Component\Messenger\Transport\TransportInterface;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 
 #[AsCommand(
     name: 'mautic:emails:advanced-send',
@@ -208,7 +210,7 @@ EOT
             if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
             if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
 
-            $filename = $transport->generateFilenameById($id, FileSystemTransport::MESSAGE_EXTENSION);
+            $filename = $transport->generateFilenameById($id);
 
             if (!$this->tryClaimFile($transport, $filename)) {
                 if ($output->isVerbose()) {
@@ -223,15 +225,18 @@ EOT
             if (!$envelope) continue;
 
             try {
-                $this->handleMessage($envelope, self::QUEUE_EMAIL, $output);
                 $processed++;
+                $this->handleMessage($envelope, $output);
             } catch (\Throwable $e) {
                 if ($output->isVerbose()) {
                     $output->writeln("<error>$id failed: {$e->getMessage()}</error>");
                 }
             }
 
-            if ($this->processedSinceLastAck >= $ackBatchSize || (time() - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
+            if(($processed > $ackBatchSize && $this->processedSinceLastAck > 0) ||
+                $this->processedSinceLastAck >= $ackBatchSize ||
+                (time() - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
+
                 $this->ackAll($transport);
             }
         }
@@ -251,31 +256,52 @@ EOT
         int $maxLoad
     ): int {
         $processed = 0;
-        $count     = 0;
 
         while (true) {
             if ($memoryLimit && memory_get_usage(true) > $memoryLimit) break;
             if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
             if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
-            if ($maxPerThread > 0 && $count >= $maxPerThread) break;
-            if ($maxLoad > 0 && $count >= $maxLoad) break;
+            if ($maxPerThread > 0 && $processed >= $maxPerThread) break;
+            if ($maxLoad > 0 && $processed >= $maxLoad) break;
 
-            $envelope = $transport->get();
-            if ($envelope === null) break;
-
-            $count++;
-
-            try {
-                $this->handleMessage($envelope, self::QUEUE_EMAIL, $output);
-                $processed++;
-            } catch (\Throwable $e) {
+            $envelopes = $transport->get();
+            if (empty($envelopes)) {
                 if ($output->isVerbose()) {
-                    $output->writeln('<error>Message handling failed: ' . $e->getMessage() . '</error>');
+                    $output->writeln('<info>Queue empty.</info>');
                 }
-                $transport->reject($envelope);
+                break;
             }
 
-            if ($this->processedSinceLastAck >= $ackBatchSize || (time() - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
+            foreach ($envelopes as $envelope) {
+                try {
+                    $processed++;
+                    $this->handleMessage($envelope, $output);
+
+                    if ($output->isDebug()) {
+                        $output->writeln("<info>[".self::QUEUE_EMAIL."] Processed #$processed</info>");
+                    }
+                } catch (\Throwable $e) {
+                    if ($output->isVerbose()) {
+                        $output->writeln('<error>Message handling failed: ' . $e->getMessage() . '</error>');
+                    }
+                    $transport->reject($envelope);
+                }
+
+                if ($memoryLimit && memory_get_usage(true) > $memoryLimit) break 2;
+                if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break 2;
+                if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break 2;
+                if ($maxPerThread > 0 && $processed >= $maxPerThread) break 2;
+                if ($maxLoad > 0 && $processed >= $maxLoad) break 2;
+
+                // Periodically ack & release memory if processed > ackBatchSize
+                if($processed > $ackBatchSize && $this->processedSinceLastAck > 0) {
+                    $this->ackAll($transport);
+                }
+            }
+
+            // Periodically ack & release memory
+            if ($this->processedSinceLastAck >= $ackBatchSize ||
+                (microtime(true) - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
                 $this->ackAll($transport);
             }
         }
@@ -355,14 +381,16 @@ EOT
             return null;
         }
 
-        try {
-            $message = $this->serializer->deserialize($content, 'object', 'php');
-            if ($message === false || $message === null) {
-                return null;
-            }
+        $data = json_decode($content, true);
+        if (!is_array($data)) {
+            return null; // or log invalid JSON
+        }
 
-            return new Envelope($message, [new TransportMessageIdStamp($id)]);
+        try {
+            $envelope = $this->serializer->decode($data);
+            return $envelope->with(new TransportMessageIdStamp($id));
         } catch (\Throwable) {
+            // log error if verbose/debug
             return null;
         }
     }
@@ -382,9 +410,9 @@ EOT
         return str_starts_with((string) $dsn, 'sync');
     }
 
-    private function handleMessage(Envelope $envelope, string $transportName, OutputInterface $output): void
+    private function handleMessage(Envelope $envelope, OutputInterface $output): void
     {
-        $event = new \Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent($envelope, $transportName);
+        $event = new WorkerMessageReceivedEvent($envelope, self::QUEUE_EMAIL);
         $this->eventDispatcher?->dispatch($event);
 
         if (!$event->shouldHandle()) {
@@ -395,7 +423,7 @@ EOT
         $envelope = $event->getEnvelope();
 
         $this->bus->dispatch($envelope->with(
-            new \Symfony\Component\Messenger\Stamp\ReceivedStamp($transportName)
+            new ReceivedStamp(self::QUEUE_EMAIL)
         ));
 
         $this->acks[] = [$envelope, null];
