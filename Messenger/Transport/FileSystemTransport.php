@@ -349,8 +349,8 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         $finder = Finder::create()
             ->in($this->directory)
             ->name([
-                '*' . FileSystemTransport::MESSAGE_EXTENSION,
-                '*' . FileSystemTransport::TRYAGAIN_EXTENSION
+                '*' . self::MESSAGE_EXTENSION,
+                '*' . self::TRYAGAIN_EXTENSION
             ])
             ->date('before ' . $timeout . ' seconds ago');
 
@@ -384,8 +384,8 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             if ($maxRetries > 0) {
                 // Rename to .message
                 $originalFile = str_replace(
-                    [ FileSystemTransport::PROCESSING_EXTENSION, self::TRYAGAIN_EXTENSION ],
-                    [ FileSystemTransport::MESSAGE_EXTENSION, FileSystemTransport::MESSAGE_EXTENSION ],
+                    [ self::PROCESSING_EXTENSION, self::TRYAGAIN_EXTENSION ],
+                    [ self::MESSAGE_EXTENSION, self::MESSAGE_EXTENSION ],
                     $file
                 );
 
