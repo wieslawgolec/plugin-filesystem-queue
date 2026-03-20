@@ -32,8 +32,10 @@ class SupervisorEmailCommand extends ModeratedCommand
     private const MAINTENANCE_IN_PROGRESS_LOCK  = 'maintenance.in.progress.lock';
     private const MAINTENANCE_SCHEDULED_LOCK    = 'maintenance.scheduled.lock';
 
-    private const QUEUE_EMAIL_THREAD_LOCK       = 'mautic-queue-email-thread';
+    private const QUEUE_EMAIL_THREAD_LOCK       = 'sf.mautic-emails-advanced-send';
     private const WAIT_FOR_ALL_THREAD_TO_FINISH = 5;
+
+    private const LOCK_CLEAN_TIME               = 60; 
 
     private const QUEUE_EMAIL = 'email';
 
@@ -51,6 +53,7 @@ class SupervisorEmailCommand extends ModeratedCommand
     private string $rateCacheFile;
     private ?int $lastRateCheckTime = null;
     private ?int $lastPendingCount = null;
+    private ?int $lastLockCleanTime = null;
 
     private string $phpBinary;
 
@@ -138,7 +141,10 @@ EOT
         while (true) {
             $now = time();
 
-            // Periodic logic check
+            // Stream output frequently
+            $this->streamThreadOutputs($quiet);
+
+            // Periodic tasks
             if ($now - $lastCheck >= $settings['check_interval']) {
                 $lastCheck = $now;
 
@@ -152,12 +158,10 @@ EOT
                     return Command::SUCCESS;
                 }
 
-                $this->cleanStaleThreadLocks();
-
                 $activeCount = $this->getActiveThreadCount();
                 $messageCount = $this->getMessageCount();
 
-                // Update dynamic rate
+                // Dynamic rate update
                 if ($this->lastRateCheckTime !== null && $this->lastPendingCount !== null) {
                     $timeDelta    = $now - $this->lastRateCheckTime;
                     $pendingDelta = $this->lastPendingCount - $messageCount;
@@ -176,10 +180,16 @@ EOT
                         $output->writeln('<info>Queue empty and all threads finished - supervisor exiting.</info>');
                     }
                     $this->log('Supervisor finished - queue empty.');
+                    $this->cleanStaleThreadLocks(); // final clean
                     return Command::SUCCESS;
                 }
 
-                // Try to start new threads if possible
+                // Periodic lock cleaning (every ~60 seconds)
+                if ($this->lastLockCleanTime === null || $now - $this->lastLockCleanTime >= self::LOCK_CLEAN_TIME) {
+                    $this->cleanStaleThreadLocks();
+                    $this->lastLockCleanTime = $now;
+                }
+
                 $desired = $this->getDesiredThreads($messageCount, $settings);
                 if ($activeCount < $desired) {
                     $this->tryStartNewThread($settings, $activeCount, $messageCount, $quiet);
@@ -187,13 +197,9 @@ EOT
 
                 // Enforce supervisor-level timeouts
                 $this->enforceProcessTimeouts($quiet);
-
-                // Stream output from our managed processes
-                $this->streamThreadOutputs($quiet);
             }
 
-            // Small sleep to prevent CPU spin
-            usleep(100_000); // 0.1s
+            usleep(200_000); // 0.2s - more responsive output polling
         }
     }
 
@@ -233,9 +239,8 @@ EOT
 
     private function getMessageCount(): int
     {
-        $transport = $this->emailTransport;
-        if ($transport instanceof MessageCountAwareInterface) {
-            return $transport->getMessageCount();
+        if ($this->emailTransport instanceof MessageCountAwareInterface) {
+            return $this->emailTransport->getMessageCount();
         }
 
         return 0;
@@ -249,7 +254,7 @@ EOT
 
     private function cleanStaleThreadLocks(): void
     {
-        $lockFiles = glob($this->runDirectory . '/'.self::QUEUE_EMAIL_THREAD_LOCK.'-*.lock');
+        $lockFiles = glob($this->runDirectory . '/'.self::QUEUE_EMAIL_THREAD_LOCK.'*.lock');
         foreach ($lockFiles as $file) {
             if (!$this->isLockFileActive($file)) {
                 @unlink($file);
@@ -259,22 +264,34 @@ EOT
 
     private function isLockFileActive(string $lockFile): bool
     {
+        var_dump("check if lock file: {$lockFile} is active");
         if (!is_readable($lockFile)) {
             return false;
         }
         $content = trim(file_get_contents($lockFile));
         if (!is_numeric($content)) {
+            var_dump("lock file: {$lockFile} content is not numeric");
             return false;
         }
         $pid = (int) $content;
+        var_dump("lock file: {$lockFile} pid: {$pid}: check result: ".(($pid > 0 && posix_getpgid($pid) !== false) ? "true" : "false" ));
         return $pid > 0 && posix_getpgid($pid) !== false;
     }
 
     private function getActiveThreadCount(): int
     {
-        $this->cleanStaleThreadLocks();
-        $lockFiles = glob($this->runDirectory . '/'.self::QUEUE_EMAIL_THREAD_LOCK.'-*.lock');
-        return count($lockFiles);
+        $lockFiles = glob($this->runDirectory . '/' . self::QUEUE_EMAIL_THREAD_LOCK . '*');
+
+        $active = 0;
+        foreach ($lockFiles as $file) {
+            if (preg_match('/^' . preg_quote(self::QUEUE_EMAIL_THREAD_LOCK, '/') . '(\d+)\./', basename($file), $m)) {
+                if ($this->isLockFileActive($file)) {
+                    $active++;
+                }
+            }
+        }
+
+        return $active;
     }
 
     private function getDesiredThreads(int $totalMessages, array $settings): int
@@ -286,7 +303,11 @@ EOT
 
     private function tryStartNewThread(array $settings, int $activeCount, int $totalMessages, bool $quiet): void
     {
-        $threadNum   = $activeCount + 1;
+        $threadId = $this->getNextThreadId();
+
+        $this->log("Assigned new thread ID: $threadId (current active: $activeCount)");
+
+        $threadNum   = $threadId; // for calculation consistency
         $baseLimit   = $settings['email_limit'] * $settings['max_threads'];
         $decrement   = $this->getCurrentDecrement($settings);
         $calculated  = $baseLimit + ($settings['max_threads'] - $threadNum) * $decrement;
@@ -306,27 +327,26 @@ EOT
         $currentMem  = $this->getMemoryUsagePercent();
 
         if ($currentLoad >= $settings['max_server_load'] || $currentMem >= $settings['max_memory_usage_percent']) {
+            $this->log("Resources too high - skipping thread $threadId start");
             return;
         }
-
-        $threadId = $this->getNextThreadId();
 
         $args = [
             $this->phpBinary,               // ← use the real PHP binary
             $this->consolePath,             // bin/console
             'mautic:emails:advanced-send',
             '--no-interaction',
-            '--thread'                      => (string) $threadId,
-            '--max-threads'                 => (string) $settings['max_threads'],
-            '--lock-name'                   => sprintf(self::QUEUE_EMAIL_THREAD_LOCK.'-%d', $threadId),
-            '--lock_mode'                   => ModeratedCommand::MODE_PID,
-            '--message-limit'               => (string) $messagesLimit,
-            '--time-limit'                  => (string) $settings['time_limit'],
-            '--memory-limit'                => $settings['memory_limit'],
+            '--thread='                      . $threadId,
+            '--max-threads='                 . $settings['max_threads'],
+            '--lock-name='                   . sprintf('%d', $threadId),
+            '--lock_mode='                   . ModeratedCommand::MODE_PID,
+            '--message-limit='               . $messagesLimit,
+            '--time-limit='                  . $settings['time_limit'],
+            '--memory-limit='                . $settings['memory_limit'],
         ];
 
         if($messagesPerThread !== AdvancedEmailSendCommand::MAX_MESSAGES_PER_THREAD) {
-            $args['--max-messages-per-thread'] = (string) $messagesPerThread;
+            $args[] = '--max-messages-per-thread=' . $messagesPerThread;
         }
 
         if ($settings['benchmark_enabled']) {
@@ -356,19 +376,13 @@ EOT
         if (!$quiet) {
             $this->output->writeln(sprintf(
                 '<info>Started thread %d (messages: %d | timeout: %ds | idle: %ds)</info>',
-                $threadId,
-                $messagesPerThread,
-                $supervisorTimeout,
-                $idleTimeout
+                $threadId, $messagesPerThread, $supervisorTimeout, $idleTimeout
             ));
         }
 
         $this->log(sprintf(
             'Started thread %d (messages: %d | timeout: %ds | idle: %ds)',
-            $threadId,
-            $messagesPerThread,
-            $supervisorTimeout,
-            $idleTimeout
+            $threadId, $messagesPerThread, $supervisorTimeout, $idleTimeout
         ));
 
         $this->log(sprintf('Started thread %d (messages/thread: %d)', $threadId, $messagesPerThread));
@@ -419,15 +433,25 @@ EOT
 
     private function getNextThreadId(): int
     {
-        $activeIds = [];
-        $lockFiles = glob($this->runDirectory . '/'.self::QUEUE_EMAIL_THREAD_LOCK.'-*.lock');
+        $lockFiles = glob($this->runDirectory . '/' . self::QUEUE_EMAIL_THREAD_LOCK . '*');
+
+        $used = [];
         foreach ($lockFiles as $file) {
-            if (preg_match('/'.self::QUEUE_EMAIL_THREAD_LOCK.'-(\d+)/', $file, $m)) {
-                $activeIds[] = (int) $m[1];
+            $basename = basename($file);
+            if (preg_match('/^' . preg_quote(self::QUEUE_EMAIL_THREAD_LOCK, '/') . '(\d+)\./', $basename, $m)) {
+                $id = (int)$m[1];
+                if ($this->isLockFileActive($file)) {
+                    $used[] = $id;
+                }
             }
         }
-        $max = $activeIds ? max($activeIds) : 0;
-        return $max + 1;
+
+        $next = 1;
+        while (in_array($next, $used, true)) {
+            $next++;
+        }
+
+        return $next;
     }
 
     private function getMemoryUsagePercent(): int
