@@ -13,6 +13,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
+use Symfony\Component\Process\Exception\ProcessTimedOutException;
 use Symfony\Component\Process\Process;
 use Symfony\Component\HttpKernel\KernelInterface;
 
@@ -22,6 +23,11 @@ use Symfony\Component\HttpKernel\KernelInterface;
 )]
 class SupervisorEmailCommand extends ModeratedCommand
 {
+    // Timeout constants
+    private const INTERNAL_TIME_LIMIT_BUFFER_SECONDS = 300;   // extra time after internal --time-limit ; most common: 60–180
+    private const MINIMUM_IDLE_TIMEOUT_SECONDS      = 180;   // minimum idle timeout (no output/error) ; most common: 120–300
+    private const GRACEFUL_STOP_TIMEOUT_SECONDS     = 10;    // seconds to wait after SIGTERM before SIGKILL ; usually 5–15 s
+
     private const MAINTENANCE_IN_PROGRESS_LOCK  = 'maintenance.in.progress.lock';
     private const MAINTENANCE_SCHEDULED_LOCK    = 'maintenance.scheduled.lock';
 
@@ -36,8 +42,14 @@ class SupervisorEmailCommand extends ModeratedCommand
     protected $runDirectory;
     private string $consolePath;
     private bool $loggingEnabled;
-    private ?string $customLogName;
     private string $logFilePath;
+
+    // Dynamic rate + enhanced settings
+    private array $settings = [];
+    private ?float $currentEmailsPerSecond = null;
+    private string $rateCacheFile;
+    private ?int $lastRateCheckTime = null;
+    private ?int $lastPendingCount = null;
 
     public function __construct(
         protected PathsHelper $pathsHelper,
@@ -50,10 +62,13 @@ class SupervisorEmailCommand extends ModeratedCommand
         $this->consolePath = $this->kernel->getProjectDir() . '/bin/console';
         $this->runDirectory = $this->pathsHelper->getSystemPath('cache') . '/../run';
 
-        // Ensure run directory exists (same as ModeratedCommand)
+        // Ensure run directory exists
         if (!is_dir($this->runDirectory) && !mkdir($this->runDirectory, 0777, true)) {
             throw new \RuntimeException('Could not create run directory: ' . $this->runDirectory);
         }
+
+        $this->rateCacheFile = $this->runDirectory . '/supervisor_emails_per_second.rate';
+        $this->loadCurrentRate();
     }
 
     protected function configure(): void
@@ -75,14 +90,15 @@ EOT
 
         // Load all settings from config.php with sensible defaults
         $settings = $this->loadSupervisorSettings();
+        $this->settings = $settings;
 
         $this->loggingEnabled = $settings['logging_enabled'];
-        $this->customLogName  = $settings['custom_log_name'] ?: null;
+        $customLogName  = $settings['custom_log_name'] ?: null;
         $this->logFilePath    = $this->pathsHelper->getSystemPath('logs') . '/' .
-            ($this->customLogName ?? 'mautic_filesystem_queue_supervisor.log');
+            ($customLogName ?? 'mautic_filesystem_queue_supervisor.log');
 
         // Do not start if email queue is in sync mode
-        if ($this->isQueueInSyncMode(self::QUEUE_EMAIL)) {
+        if ($this->isQueueInSyncMode()) {
             if (!$quiet) {
                 $output->writeln('<info>Email queue is in sync mode - supervisor exiting.</info>');
             }
@@ -110,7 +126,6 @@ EOT
             $output->writeln(sprintf('<info>Resuming supervision - %d threads already running.</info>', $activeCount));
         }
 
-        $startTime = time();
         $lastCheck = 0;
 
         while (true) {
@@ -125,7 +140,7 @@ EOT
                     if (!$quiet) {
                         $output->writeln('<comment>Maintenance lock appeared - waiting for all threads to finish...</comment>');
                     }
-                    $this->waitForAllThreadsToFinish($settings, $quiet);
+                    $this->waitForAllThreadsToFinish($quiet);
                     $this->log('Supervisor exited due to maintenance lock.');
                     return Command::SUCCESS;
                 }
@@ -134,6 +149,19 @@ EOT
 
                 $activeCount = $this->getActiveThreadCount();
                 $messageCount = $this->getMessageCount();
+
+                // Update dynamic rate
+                if ($this->lastRateCheckTime !== null && $this->lastPendingCount !== null) {
+                    $timeDelta    = $now - $this->lastRateCheckTime;
+                    $pendingDelta = $this->lastPendingCount - $messageCount;
+
+                    if ($timeDelta >= 5 && $pendingDelta > 0) {
+                        $observedRate = $pendingDelta / $timeDelta;
+                        $this->updateDynamicRate($observedRate);
+                    }
+                }
+                $this->lastRateCheckTime = $now;
+                $this->lastPendingCount  = $messageCount;
 
                 // Exit condition: no messages and no running threads
                 if ($messageCount === 0 && $activeCount === 0) {
@@ -145,9 +173,13 @@ EOT
                 }
 
                 // Try to start new threads if possible
-                if ($activeCount < $settings['max_threads'] && $messageCount >= $settings['min_messages_per_thread']) {
+                $desired = $this->getDesiredThreads($messageCount, $settings);
+                if ($activeCount < $desired) {
                     $this->tryStartNewThread($settings, $activeCount, $messageCount, $quiet);
                 }
+
+                // Enforce supervisor-level timeouts
+                $this->enforceProcessTimeouts($quiet);
 
                 // Stream output from our managed processes
                 $this->streamThreadOutputs($quiet);
@@ -162,9 +194,15 @@ EOT
     {
         return [
             'max_threads'                  => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_max_threads', 8),
-            'initial_threads'              => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_initial_threads', 2),
-            'min_messages_per_thread'      => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_min_messages_per_thread', 10),
-            'time_limit'                   => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_time_limit', 300),
+            'initial_threads'              => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_initial_threads', 1),
+            'email_limit'                  => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_email_limit', 300),
+            'settle_time'                  => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_settle_time', 15),
+            'emails_per_extra_thread'      => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_emails_per_extra_thread', 250),
+            'emails_per_second_initial'    => (float) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_emails_per_second_initial', 0.8),
+            'rate_smoothing_factor'        => (float) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_rate_smoothing_factor', 0.3),
+            'dynamic_rate_enabled'         => (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_dynamic_rate_enabled', true),
+            'max_messages_per_thread'      => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_max_messages_per_thread', 0), // 0 = no cap
+            'time_limit'                   => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_time_limit', 3600),
             'memory_limit'                 => (string) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_memory_limit', '256M'),
             'max_server_load'              => (float) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_max_server_load', 4.0),
             'max_memory_usage_percent'     => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_max_memory_usage_percent', 80),
@@ -176,13 +214,13 @@ EOT
             'custom_log_name'              => (string) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_custom_log_name', ''),
             'benchmark_enabled'            => (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_benchmark_enabled', false),
             'verbosity_level'              => (int) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_verbosity_level', 0),
-            'check_maintenance_locks'      => (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_check_maintenance_locks', true),
+            'check_maintenance_locks'      => (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_supervisor_check_maintenance_locks', false),
         ];
     }
 
-    private function isQueueInSyncMode(string $queue): bool
+    private function isQueueInSyncMode(): bool
     {
-        $dsn = $this->coreParametersHelper->get('mautic.messenger_dsn_' . $queue);
+        $dsn = $this->coreParametersHelper->get('mautic.messenger_dsn_' . self::QUEUE_EMAIL);
         return $dsn && str_starts_with($dsn, 'sync://');
     }
 
@@ -219,7 +257,7 @@ EOT
         }
         $content = trim(file_get_contents($lockFile));
         if (!is_numeric($content)) {
-            return false; // not a PID file
+            return false;
         }
         $pid = (int) $content;
         return $pid > 0 && posix_getpgid($pid) !== false;
@@ -232,13 +270,30 @@ EOT
         return count($lockFiles);
     }
 
+    private function getDesiredThreads(int $totalMessages, array $settings): int
+    {
+        $extra   = (int) floor($totalMessages / $settings['emails_per_extra_thread']);
+        $desired = $settings['initial_threads'] + $extra;
+        return min($desired, $settings['max_threads']);
+    }
+
     private function tryStartNewThread(array $settings, int $activeCount, int $totalMessages, bool $quiet): void
     {
-        $plannedThreads = $activeCount + 1;
-        $messagesPerThread = (int) floor($totalMessages / $plannedThreads) + ($settings['min_messages_per_thread'] * $activeCount);
+        $threadNum   = $activeCount + 1;
+        $baseLimit   = $settings['email_limit'] * $settings['max_threads'];
+        $decrement   = $this->getCurrentDecrement($settings);
+        $calculated  = $baseLimit + ($settings['max_threads'] - $threadNum) * $decrement;
 
-        // Respect max per thread from advanced command
-        $messagesPerThread = min($messagesPerThread, 10000);
+        $messagesLimit = ($totalMessages < $baseLimit)
+            ? $totalMessages
+            : min($calculated, $totalMessages);
+
+        // Optional hard cap (0 = disabled)
+        if ($settings['max_messages_per_thread'] > 0) {
+            $messagesPerThread = min(AdvancedEmailSendCommand::MAX_MESSAGES_PER_THREAD, max($messagesLimit, $settings['max_messages_per_thread']));
+        } else {
+            $messagesPerThread = false;
+        }
 
         $currentLoad = sys_getloadavg()[0];
         $currentMem  = $this->getMemoryUsagePercent();
@@ -253,46 +308,104 @@ EOT
             $this->consolePath,
             'mautic:emails:advanced-send',
             '--no-interaction',
-            '--thread', (string) $threadId,
-            '--max-threads', (string) $settings['max_threads'],
-            '--lock-name', sprintf(self::QUEUE_EMAIL_THREAD_LOCK.'-%d', $threadId),
-            '--message-limit', (string) $messagesPerThread,
-            '--time-limit', (string) $settings['time_limit'],
-            '--memory-limit', $settings['memory_limit'],
+            '--thread'                      => (string) $threadId,
+            '--max-threads'                 => (string) $settings['max_threads'],
+            '--lock-name'                   => sprintf(self::QUEUE_EMAIL_THREAD_LOCK.'-%d', $threadId),
+            '--lock_mode'                   => ModeratedCommand::MODE_PID,
+            '--message-limit'               => (string) $messagesLimit,
+            '--time-limit'                  => (string) $settings['time_limit'],
+            '--memory-limit'                => $settings['memory_limit'],
         ];
+
+        if($messagesPerThread !== AdvancedEmailSendCommand::MAX_MESSAGES_PER_THREAD) {
+            $args['--max-messages-per-thread'] = (string) $messagesPerThread;
+        }
 
         if ($settings['benchmark_enabled']) {
             $args[] = '--benchmark';
         }
 
         // Add verbosity
-        if($settings['verbosity_level'] > 2) {
+        if ($settings['verbosity_level'] > 2) {
             $args[] = '-vvv';
-        } else if($settings['verbosity_level'] == 2) {
+        } elseif ($settings['verbosity_level'] == 2) {
             $args[] = '-vv';
-        } else if($settings['verbosity_level'] == 1) {
+        } elseif ($settings['verbosity_level'] == 1) {
             $args[] = '-v';
         }
 
         $process = new Process($args);
-        $process->setTimeout(null);
+        // Supervisor-level safety timeouts
+        $supervisorTimeout = $settings['time_limit'] + self::INTERNAL_TIME_LIMIT_BUFFER_SECONDS;
+        $idleTimeout = max(self::MINIMUM_IDLE_TIMEOUT_SECONDS, (int)($supervisorTimeout * 0.5));
+
+        $process->setTimeout($supervisorTimeout);
+        $process->setIdleTimeout($idleTimeout);
         $process->start();
 
         $this->activeProcesses[$threadId] = $process;
 
         if (!$quiet) {
-            $this->output->writeln(sprintf('<info>Started thread %d (messages/thread: %d)</info>', $threadId, $messagesPerThread));
+            $this->output->writeln(sprintf(
+                '<info>Started thread %d (messages: %d | timeout: %ds | idle: %ds)</info>',
+                $threadId,
+                $messagesPerThread,
+                $supervisorTimeout,
+                $idleTimeout
+            ));
         }
-        $this->log(sprintf('Started thread %d', $threadId));
 
-        // Wait delay and check increase
+        $this->log(sprintf(
+            'Started thread %d (messages: %d | timeout: %ds | idle: %ds)',
+            $threadId,
+            $messagesPerThread,
+            $supervisorTimeout,
+            $idleTimeout
+        ));
+
+        $this->log(sprintf('Started thread %d (messages/thread: %d)', $threadId, $messagesPerThread));
+
+        // Wait delay and check resource increase
         sleep($settings['delay_between_threads']);
+
         $newLoad = sys_getloadavg()[0];
         $newMem  = $this->getMemoryUsagePercent();
 
         if (($newLoad - $currentLoad) > $settings['max_load_increase'] ||
             ($newMem - $currentMem) > $settings['max_mem_increase_percent']) {
             $this->log(sprintf('WARNING: Thread %d caused excessive resource increase', $threadId));
+        }
+    }
+
+    private function enforceProcessTimeouts(bool $quiet): void
+    {
+        foreach ($this->activeProcesses as $threadId => $process) {
+            if (!$process->isRunning()) {
+                continue;
+            }
+
+            try {
+                $process->checkTimeout();
+            } catch (ProcessTimedOutException $e) {
+                $timeoutType = $e->isGeneralTimeout() ? 'general' : 'idle';
+                $this->log(sprintf(
+                    'Supervisor killing thread %d (%s timeout exceeded %d s)',
+                    $threadId,
+                    $timeoutType,
+                    $process->getTimeout()
+                ));
+
+                if (!$quiet) {
+                    $this->output->writeln(sprintf(
+                        '<error>Supervisor killing thread %d (%s timeout exceeded)</error>',
+                        $threadId,
+                        $timeoutType
+                    ));
+                }
+
+                $process->stop(self::GRACEFUL_STOP_TIMEOUT_SECONDS, SIGKILL);
+                unset($this->activeProcesses[$threadId]);
+            }
         }
     }
 
@@ -355,7 +468,6 @@ EOT
 
     private function cleanThreadOutput(string $buffer): string
     {
-        // Remove common timestamp prefixes added by --no-interaction / Symfony formatter
         $buffer = preg_replace('/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s+/m', '', $buffer);
         $buffer = preg_replace('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+/m', '', $buffer);
         return trim($buffer);
@@ -367,7 +479,7 @@ EOT
         file_put_contents($this->logFilePath, $line, FILE_APPEND | LOCK_EX);
     }
 
-    private function waitForAllThreadsToFinish(array $settings, bool $quiet): void
+    private function waitForAllThreadsToFinish(bool $quiet): void
     {
         while (true) {
             $this->cleanStaleThreadLocks();
@@ -380,5 +492,40 @@ EOT
             }
             sleep(self::WAIT_FOR_ALL_THREAD_TO_FINISH);
         }
+    }
+
+    private function loadCurrentRate(): void
+    {
+        if (file_exists($this->rateCacheFile)) {
+            $rate = (float) trim(file_get_contents($this->rateCacheFile));
+            $this->currentEmailsPerSecond = max(0.1, min(20.0, $rate));
+        } else {
+            $this->currentEmailsPerSecond = $this->settings['emails_per_second_initial'] ?? 0.8;
+        }
+    }
+
+    private function saveCurrentRate(float $rate): void
+    {
+        $safeRate = max(0.1, min(20.0, $rate));
+        file_put_contents($this->rateCacheFile, $safeRate, LOCK_EX);
+        $this->currentEmailsPerSecond = $safeRate;
+    }
+
+    private function updateDynamicRate(float $observedRate): void
+    {
+        if (!$this->settings['dynamic_rate_enabled']) {
+            return;
+        }
+        $oldRate = $this->currentEmailsPerSecond ?? 0.8;
+        $weight  = $this->settings['rate_smoothing_factor'];
+
+        $newRate = ($oldRate * (1 - $weight)) + ($observedRate * $weight);
+        $this->saveCurrentRate($newRate);
+    }
+
+    private function getCurrentDecrement(array $settings): int
+    {
+        $rate = $this->currentEmailsPerSecond ?? ($settings['emails_per_second_initial'] ?? 0.8);
+        return (int) round($rate * $settings['settle_time']);
     }
 }
