@@ -17,13 +17,19 @@ return [
         'filesystem_queue_hit_time_limit' => null,
         'filesystem_queue_failed_msg_limit' => null,
         'filesystem_queue_failed_time_limit' => null,
-    
+
         // Supervisor tuning parameters (used by mautic:emails:supervisor)
+        'filesystem_queue_supervisor_initial_threads'              => 1,
         'filesystem_queue_supervisor_max_threads'                  => 8,
-        'filesystem_queue_supervisor_initial_threads'              => 2,
-        'filesystem_queue_supervisor_min_messages_per_thread'      => 10,
-        'filesystem_queue_supervisor_time_limit'                   => 300,           // seconds per thread
+        'filesystem_queue_supervisor_time_limit'                   => 3600,         // seconds per thread
         'filesystem_queue_supervisor_memory_limit'                 => '256M',
+        'filesystem_queue_supervisor_email_limit'                  => 300,
+        'filesystem_queue_supervisor_settle_time'                  => 15,
+        'filesystem_queue_supervisor_emails_per_extra_thread'      => 250,
+        'filesystem_queue_supervisor_emails_per_second_initial'    => 0.8,          // average email sent per second
+        'filesystem_queue_supervisor_rate_smoothing_factor'        => 0.3,
+        'filesystem_queue_supervisor_dynamic_rate_enabled'         => true,
+        'filesystem_queue_supervisor_max_messages_per_thread'      => 0,            // 0 = no cap (use mautic:emails:advanced-send command cap)
         'filesystem_queue_supervisor_max_server_load'              => 4.0,
         'filesystem_queue_supervisor_max_memory_usage_percent'     => 80,
         'filesystem_queue_supervisor_delay_between_threads'        => 5,            // seconds
@@ -34,6 +40,6 @@ return [
         'filesystem_queue_supervisor_custom_log_name'              => '',           // leave empty for default: mautic_filesystem_queue_supervisor.log
         'filesystem_queue_supervisor_benchmark_enabled'            => false,
         'filesystem_queue_supervisor_verbosity_level'              => 0,            // 0 = none, 1 = -v, 2 = -vv, 3 = -vvv
-        'filesystem_queue_supervisor_check_maintenance_locks'      => false,    
+        'filesystem_queue_supervisor_check_maintenance_locks'      => false,
     ],
 ];
