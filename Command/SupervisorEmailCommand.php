@@ -288,11 +288,11 @@ EOT
             ? $totalMessages
             : min($calculated, $totalMessages);
 
+        $messagesPerThread = AdvancedEmailSendCommand::MAX_MESSAGES_PER_THREAD;
+
         // Optional hard cap (0 = disabled)
         if ($settings['max_messages_per_thread'] > 0) {
             $messagesPerThread = min(AdvancedEmailSendCommand::MAX_MESSAGES_PER_THREAD, max($messagesLimit, $settings['max_messages_per_thread']));
-        } else {
-            $messagesPerThread = false;
         }
 
         $currentLoad = sys_getloadavg()[0];
@@ -441,11 +441,62 @@ EOT
     private function streamThreadOutputs(bool $quiet): void
     {
         foreach ($this->activeProcesses as $threadId => $process) {
-            if (!$process->isRunning()) {
+            // ────────────────────────────────────────────────
+            // First: check if process has terminated
+            // ────────────────────────────────────────────────
+            if (!$process->isRunning() && !$process->isStarted()) {
+                // Process never really started or was already cleaned
                 unset($this->activeProcesses[$threadId]);
                 continue;
             }
 
+            if (!$process->isRunning()) {
+                $exitCode      = $process->getExitCode();
+                $exitCodeText  = $process->getExitCodeText() ?? 'no description';
+                $termSignal    = $process->getTermSignal();
+                $signalText    = $termSignal ? " (signal $termSignal)" : '';
+
+                $msg = sprintf(
+                    'Thread %d terminated - exit code: %s, text: "%s"%s',
+                    $threadId,
+                    $exitCode !== null ? $exitCode : 'null',
+                    $exitCodeText,
+                    $signalText
+                );
+
+                if ($exitCode === 0) {
+                    // Normal success
+                    $this->log($msg . ' (success)');
+                } elseif ($exitCode === null && $termSignal) {
+                    // Killed by supervisor timeout or external signal
+                    $this->log($msg . ' (terminated by signal)');
+                    if (!$quiet) {
+                        $this->output->writeln("<comment>$msg</comment>");
+                    }
+                } else {
+                    // Error / abnormal exit
+                    $errOutput = trim($process->getErrorOutput());
+                    $this->log($msg . ' — FAILURE');
+                    if ($errOutput) {
+                        $this->log("stderr:\n" . $errOutput);
+                    }
+
+                    if (!$quiet) {
+                        $this->output->writeln(sprintf('<error>%s</error>', $msg));
+                        if ($errOutput) {
+                            $this->output->writeln('<error>stderr excerpt:</error>');
+                            $this->output->writeln(substr($errOutput, 0, 1000)); // avoid flooding console
+                        }
+                    }
+                }
+
+                unset($this->activeProcesses[$threadId]);
+                continue;
+            }
+
+            // ────────────────────────────────────────────────
+            // Process still running → normal output streaming
+            // ────────────────────────────────────────────────
             $out = $process->getIncrementalOutput();
             $err = $process->getIncrementalErrorOutput();
 
