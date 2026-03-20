@@ -33,7 +33,7 @@ use Symfony\Component\Finder\Finder;
 )]
 class AdvancedEmailSendCommand extends ModeratedCommand
 {
-    public const MAX_MESSAGES_PER_THREAD = 10000;
+    public const MAX_MESSAGES_PER_THREAD = 50000;
 
     private int $processedSinceLastAck = 0;
     private int $lastAckTime = 0;
@@ -88,7 +88,7 @@ Advanced email sender with multi-threading support.
 - Other transports: standard repeated get() loop (similar to original consume command)
 - Lock name auto-generated: mautic-queue-email-thread-X-of-Y
 EOT
-        );
+            );
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -116,7 +116,7 @@ EOT
             }
             return Command::SUCCESS;
         }
-        
+
         // Thread based lock (unless --lock-name was forced)
         $lockName = $input->getOption('lock-name') ?: sprintf('mautic-queue-email-thread-%d-of-%d', $thread, $maxThreads);
 
@@ -343,8 +343,8 @@ EOT
 
         $finder = Finder::create()
             ->in($this->queueDirectory)
-            ->name('*' . FileSystemTransport::MESSAGE_EXTENSION)
-            ->sortByName();   // oldest first (like transport when !autoShuffle)
+            ->name('*' . FileSystemTransport::MESSAGE_EXTENSION);
+            //->sortByName();   // oldest first (like transport when !autoShuffle)
 
         $ids = [];
 
