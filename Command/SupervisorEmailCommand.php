@@ -16,6 +16,7 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
 use Symfony\Component\Process\Process;
 use Symfony\Component\HttpKernel\KernelInterface;
+use Symfony\Component\Process\PhpExecutableFinder;
 
 #[AsCommand(
     name: 'mautic:emails:supervisor',
@@ -51,6 +52,8 @@ class SupervisorEmailCommand extends ModeratedCommand
     private ?int $lastRateCheckTime = null;
     private ?int $lastPendingCount = null;
 
+    private string $phpBinary;
+
     public function __construct(
         protected PathsHelper $pathsHelper,
         protected CoreParametersHelper $coreParametersHelper,
@@ -66,6 +69,10 @@ class SupervisorEmailCommand extends ModeratedCommand
         if (!is_dir($this->runDirectory) && !mkdir($this->runDirectory, 0777, true)) {
             throw new \RuntimeException('Could not create run directory: ' . $this->runDirectory);
         }
+
+        // Find the actual PHP binary used to run this script
+        $finder = new PhpExecutableFinder();
+        $this->phpBinary = $finder->find() ?: PHP_BINARY;
 
         $this->rateCacheFile = $this->runDirectory . '/supervisor_emails_per_second.rate';
         $this->loadCurrentRate();
@@ -305,7 +312,8 @@ EOT
         $threadId = $this->getNextThreadId();
 
         $args = [
-            $this->consolePath,
+            $this->phpBinary,               // ← use the real PHP binary
+            $this->consolePath,             // bin/console
             'mautic:emails:advanced-send',
             '--no-interaction',
             '--thread'                      => (string) $threadId,
@@ -427,15 +435,42 @@ EOT
         if (!file_exists('/proc/meminfo')) {
             return 0;
         }
+
         $meminfo = file_get_contents('/proc/meminfo');
-        preg_match('/MemTotal:\s+(\d+)/', $meminfo, $total);
-        preg_match('/MemAvailable:\s+(\d+)/', $meminfo, $avail);
-        if (empty($total[1])) {
+        if ($meminfo === false) {
             return 0;
         }
-        $total = (int) $total[1];
-        $avail = isset($avail[1]) ? (int) $avail[1] : 0;
-        return (int) round(100 * ($total - $avail) / $total);
+
+        $lines = explode("\n", $meminfo);
+        $data = [];
+
+        foreach ($lines as $line) {
+            if (preg_match('/^(\w+):\s+(\d+)/', $line, $m)) {
+                $data[$m[1]] = (int)$m[2];
+            }
+        }
+
+        if (!isset($data['MemTotal'], $data['MemAvailable'], $data['SwapTotal'], $data['SwapFree'])) {
+            return 0;
+        }
+
+        $totalPhysical = $data['MemTotal'];
+        $availPhysical = $data['MemAvailable'];
+
+        $totalSwap     = $data['SwapTotal'];
+        $usedSwap      = $data['SwapTotal'] - $data['SwapFree'];
+
+        $totalSystem   = $totalPhysical + $totalSwap;
+        if ($totalSystem <= 0) {
+            return 0;
+        }
+
+        $usedSystem = ($totalPhysical - $availPhysical) + $usedSwap;
+
+        $percent = (int) round(100 * $usedSystem / $totalSystem);
+
+        // Optional: cap at 100 in case of calculation rounding issues
+        return min(100, max(0, $percent));
     }
 
     private function streamThreadOutputs(bool $quiet): void
