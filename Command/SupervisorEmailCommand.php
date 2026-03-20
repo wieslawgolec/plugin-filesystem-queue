@@ -15,7 +15,6 @@ use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Process\Process;
 use Symfony\Component\HttpKernel\KernelInterface;
-use Symfony\Component\Finder\Finder;
 
 #[AsCommand(
     name: 'mautic:emails:supervisor',
@@ -34,7 +33,7 @@ class SupervisorEmailCommand extends ModeratedCommand
     /** @var Process[] Thread ID => Process instance (only for threads started by this supervisor instance) */
     private array $activeProcesses = [];
 
-    private string $runDirectory;
+    protected $runDirectory;
     private string $consolePath;
     private bool $loggingEnabled;
     private ?string $customLogName;
@@ -200,7 +199,7 @@ EOT
     private function isMaintenanceActive(): bool
     {
         return file_exists($this->runDirectory . '/' . self::MAINTENANCE_IN_PROGRESS_LOCK) ||
-               file_exists($this->runDirectory . '/' . self::MAINTENANCE_SCHEDULED_LOCK);
+            file_exists($this->runDirectory . '/' . self::MAINTENANCE_SCHEDULED_LOCK);
     }
 
     private function cleanStaleThreadLocks(): void
@@ -268,15 +267,15 @@ EOT
 
         // Add verbosity
         if($settings['verbosity_level'] > 2) {
-          $args[] = '-vvv';
+            $args[] = '-vvv';
         } else if($settings['verbosity_level'] == 2) {
-          $args[] = '-vv';
+            $args[] = '-vv';
         } else if($settings['verbosity_level'] == 1) {
-          $args[] = '-v';
+            $args[] = '-v';
         }
 
         $process = new Process($args);
-        $process->setTimeout(null); 
+        $process->setTimeout(null);
         $process->start();
 
         $this->activeProcesses[$threadId] = $process;
