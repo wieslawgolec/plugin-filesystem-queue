@@ -105,7 +105,7 @@ EOT
         $this->loggingEnabled = $settings['logging_enabled'];
         $customLogName  = $settings['custom_log_name'] ?: null;
         $this->logFilePath    = $this->pathsHelper->getSystemPath('logs') . '/' .
-            ($customLogName ?? 'mautic_filesystem_queue_supervisor.log');
+            ($customLogName ?? 'queue_supervisor-'.date('Y-m-d').'.log');
 
         // Do not start if email queue is in sync mode
         if ($this->isQueueInSyncMode()) {
@@ -264,17 +264,14 @@ EOT
 
     private function isLockFileActive(string $lockFile): bool
     {
-        var_dump("check if lock file: {$lockFile} is active");
         if (!is_readable($lockFile)) {
             return false;
         }
         $content = trim(file_get_contents($lockFile));
         if (!is_numeric($content)) {
-            var_dump("lock file: {$lockFile} content is not numeric");
             return false;
         }
         $pid = (int) $content;
-        var_dump("lock file: {$lockFile} pid: {$pid}: check result: ".(($pid > 0 && posix_getpgid($pid) !== false) ? "true" : "false" ));
         return $pid > 0 && posix_getpgid($pid) !== false;
     }
 
@@ -376,16 +373,16 @@ EOT
         if (!$quiet) {
             $this->output->writeln(sprintf(
                 '<info>Started thread %d (messages: %d | timeout: %ds | idle: %ds)</info>',
-                $threadId, $messagesPerThread, $supervisorTimeout, $idleTimeout
+                $threadId, $messagesLimit, $supervisorTimeout, $idleTimeout
             ));
         }
 
         $this->log(sprintf(
             'Started thread %d (messages: %d | timeout: %ds | idle: %ds)',
-            $threadId, $messagesPerThread, $supervisorTimeout, $idleTimeout
+            $threadId, $messagesLimit, $supervisorTimeout, $idleTimeout
         ));
 
-        $this->log(sprintf('Started thread %d (messages/thread: %d)', $threadId, $messagesPerThread));
+        $this->log(sprintf('Started thread %d (messages/thread: %d)', $threadId, $messagesLimit));
 
         // Wait delay and check resource increase
         sleep($settings['delay_between_threads']);
