@@ -1,0 +1,23 @@
+{
+    "name": "wieslawgolec/plugin-filesystem-queue",
+    "description": "Filesystem-based queue transport for Mautic 7 (email, hit, failed queues)",
+    "type": "mautic-plugin",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Wieslaw Golec"
+        }
+    ],
+    "require": {
+        "php": "^8.1",
+        "mautic/core-lib": "^7.0"
+    },
+    "extra": {
+        "mautic-plugin-name": "FileSystemQueueBundle"
+    },
+    "autoload": {
+        "psr-4": {
+            "MauticPlugin\\FileSystemQueueBundle\\": ""
+        }
+    }
+}
