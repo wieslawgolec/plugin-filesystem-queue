@@ -103,7 +103,7 @@ EOT
         $this->settings = $settings;
 
         $this->loggingEnabled = $settings['logging_enabled'];
-        $customLogName  = $settings['custom_log_name'] ?: null;
+        $customLogName        = $settings['custom_log_name'] ?: null;
         $this->logFilePath    = $this->pathsHelper->getSystemPath('logs') . '/' .
             ($customLogName ?? 'queue_supervisor-'.date('Y-m-d').'.log');
 
