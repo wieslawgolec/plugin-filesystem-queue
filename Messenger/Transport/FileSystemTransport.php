@@ -3,6 +3,7 @@
 namespace MauticPlugin\FileSystemQueueBundle\Messenger\Transport;
 
 use Mautic\CoreBundle\Helper\CoreParametersHelper;
+use Mautic\CoreBundle\Helper\PathsHelper;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Finder\Finder;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
@@ -11,25 +12,29 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
+use Symfony\Component\Messenger\Transport\Receiver\KeepaliveReceiverInterface;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
-class FileSystemTransport implements ListableReceiverInterface,TransportInterface, MessageCountAwareInterface
+class FileSystemTransport implements ListableReceiverInterface,TransportInterface, MessageCountAwareInterface, KeepaliveReceiverInterface
 {
-    public const TRYAGAIN_EXTENSION   = '.tryagain';
     public const MESSAGE_EXTENSION    = '.message';
     public const PROCESSING_EXTENSION = '.processing';
 
+    public const SEND_MAX_RETRIES     = 10;
+
     private SerializerInterface $serializer;
     private string $directory;
+    private ?int $lastRecoveryTime     = null;   // timestamp of last recovery run
 
     public function __construct(
         string $directory,
         SerializerInterface $serializer = null,
-        private CoreParametersHelper $coreParametersHelper
+        private CoreParametersHelper $coreParametersHelper,
+        protected PathsHelper $pathsHelper,
     ) {
-        $this->directory = rtrim($directory, '/');
+        $this->directory   = rtrim($directory, '/');
 
-        $this->serializer = $serializer ?? new PhpSerializer();
+        $this->serializer  = $serializer ?? new PhpSerializer();
     }
 
     public function getDirectory(): string
@@ -44,18 +49,43 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
 
     public function send(Envelope $envelope): Envelope
     {
-        $id = $this->generateUniqueId();
+        $serialized = $this->serializer->encode($envelope);
+        $jsonData = json_encode($serialized);
+        if ($jsonData === false) {
+            throw new TransportException('Non-retryable file error in send: Failed to JSON-encode the envelope for filesystem queue.');
+        }
+
+        // Generate file name (datetime with microsec + random string
+        // It should be unique with single attempt as it include microsecs with 6 digits
+        // 2026-04-20 15:59:59.123456 => 20260420155959123456
+        $id = date("YmdHis") . substr((string)microtime(), 2, 6).'.'.$this->getRandomString();
         $fileName = $this->generateFilenameById($id);
 
-        $this->withFileRetry(function () use ($envelope, $fileName) {
-            $serialized = $this->serializer->encode($envelope);
-            $result = @file_put_contents($fileName, json_encode($serialized), LOCK_EX);
-            if ($result === false) {
-                throw new TransportException("Write failed: $fileName");
-            }
-        }, 'send');
+        $maxRetries = self::SEND_MAX_RETRIES;
+        $i = 0;
 
-        return $envelope->with(new TransportMessageIdStamp($id));
+        do {
+            /* We try an exclusive creation of the file. This is an atomic operation, it avoid locking mechanism */
+            $fp = @fopen($fileName, 'xb');
+            if (false !== $fp) {
+                if (false === fwrite($fp, $jsonData)) {
+                    throw new TransportException("Non-retryable file error in send: Write failed: $fileName", 0);
+                }
+                fclose($fp);
+
+                return $envelope->with(new TransportMessageIdStamp($id));
+            }
+
+            if(++$i < $maxRetries) {
+                /* The file already exists, we try a longer fileName */
+                $id .= $this->getRandomString(1);
+                $fileName = $this->generateFilenameById($id);
+            } else {
+                break;
+            }
+        } while(true);
+
+        throw new TransportException("Max retries ($maxRetries) exceeded in send: Write falied: $fileName", 0);
     }
 
     public function ack(Envelope $envelope): void
@@ -90,26 +120,34 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
 
     public function get(): iterable
     {
-        $this->recoverStuckProcessingFiles();
+        $intervalSeconds = max(5, (int) $this->coreParametersHelper->get(
+            'mautic.filesystem_queue_recovery_interval',
+            30   // default: every 30 seconds
+        ));
+
+        $recoverStuck = (bool) $this->coreParametersHelper->get(
+            'mautic.filesystem_queue_recovery_stuck',
+            true
+        );
+
+        if($recoverStuck === true) {
+            $now = time();
+
+            if ($this->lastRecoveryTime === null || ($now - $this->lastRecoveryTime) >= $intervalSeconds) {
+                $this->recoverStuckProcessingFiles();
+                $this->lastRecoveryTime = $now;
+            }
+        }
 
         $batchSize = max(1, (int) $this->coreParametersHelper->get(
             'mautic.filesystem_queue_batch_size',
             1
         ));
 
-        $files = glob($this->directory . '/*' . self::MESSAGE_EXTENSION);
-
-        if ($files === false || $files === []) {
-            return [];
-        }
-
         $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
-        if($autoShuffle) {
-            shuffle($files);
-        } else {
-            // Sort by modification time - oldest first
-            usort($files, static fn($a, $b) => basename($a) <=> basename($b));
-        }
+
+        $offset = $autoShuffle === false ? 0 : rand(0, max(0, $this->total() - 1));
+        $files = new \LimitIterator(new \IteratorIterator($this->listMessageIdsGenerator()), $offset);
 
         $envelopes = [];
 
@@ -126,6 +164,42 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         }
 
         return $envelopes;
+    }
+
+    /**
+     * Refreshes mtime on .processing file WITHOUT using touch() and without ever creating files.
+     * $seconds parameter is accepted but ignored (filesystem uses filectime + configured timeout).
+     */
+    public function keepalive(Envelope $envelope, ?int $seconds = null): void
+    {
+        $filename = $this->getFileForEnvelope($envelope, self::PROCESSING_EXTENSION);
+
+        if (!$filename || !file_exists($filename)) {
+            return;
+        }
+
+        $this->withFileRetry(static function () use ($filename): void {
+            // Double-check inside retry block (protects against race)
+            if (!file_exists($filename)) {
+                return;
+            }
+
+            $fp = @fopen($filename, 'r+');
+            if (false === $fp) {
+                throw new TransportException(sprintf('Unable to open keepalive file for update "%s".', $filename));
+            }
+
+            // Minimal operation that forces mtime update without changing content
+            // ftruncate + fwrite(0 bytes) or even just fclose() after open is enough on most FS
+            if (false === @ftruncate($fp, 0)) {
+                @fclose($fp);
+                throw new TransportException(sprintf('Unable to truncate keepalive file "%s".', $filename));
+            }
+
+            if (false === @fclose($fp)) {
+                throw new TransportException(sprintf('Unable to close keepalive file "%s".', $filename));
+            }
+        }, 'keepalive');
     }
 
     /**
@@ -243,25 +317,28 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
             $e instanceof \ErrorException && str_contains($msg, 'fopen') && str_contains($msg, 'failed');
     }
 
+    public function listMessageIdsGenerator(string $extension = self::MESSAGE_EXTENSION): \Generator
+    {
+        $finder = Finder::create()
+            ->in($this->directory)
+            ->name('*' . $extension);
+            //->sortByName();   // oldest first (like transport when !autoShuffle)
+
+        foreach ($finder as $fileInfo) {
+            yield $fileInfo->getBasename($extension);
+        }
+    }
+
     /**
      * Returns all ready messages (up to limit) as Envelopes with stamps.
      */
     public function all(?int $limit = null): iterable
     {
-        $files = glob($this->directory . '/*' . self::MESSAGE_EXTENSION);
-
-        if ($files === false || $files === []) {
-            return [];
-        }
-
         $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
-        if($autoShuffle) {
-            shuffle($files);
-        } else {
-            // Sort by modification time - oldest first
-            usort($files, static fn($a, $b) => basename($a) <=> basename($b));
-        }
-        
+
+        $offset = ($limit === null || $autoShuffle === false) ? 0 : rand(0, max(0, $this->total() - $limit - 1));
+        $files = new \LimitIterator(new \IteratorIterator($this->listMessageIdsGenerator()), $offset, $limit === null ? -1 : $limit);
+
         $count = 0;
         foreach ($files as $filename) {
             if ($limit !== null && $count >= $limit) {
@@ -337,20 +414,14 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     public function recoverStuckProcessingFiles(): void
     {
         $timeout = $this->coreParametersHelper->get(
-            'mautic.messenger_retry_strategy_delay',
-            2700  // default 45 hour
-        );
-
-        $maxRetries = $this->coreParametersHelper->get(
-            'mautic.messenger_retry_strategy_max_retries',
-            0   // default 0 = no retry → delete
+            'mautic.filesystem_queue_recovery_timeout',
+            3600  // default 1 hour
         );
 
         $finder = Finder::create()
             ->in($this->directory)
             ->name([
-                '*' . self::MESSAGE_EXTENSION,
-                '*' . self::TRYAGAIN_EXTENSION
+                '*' . self::PROCESSING_EXTENSION
             ])
             ->date('before ' . $timeout . ' seconds ago');
 
@@ -381,30 +452,33 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
                 continue;
             }
 
-            if ($maxRetries > 0) {
-                // Rename to .message
-                $originalFile = str_replace(
-                    [ self::PROCESSING_EXTENSION, self::TRYAGAIN_EXTENSION ],
-                    [ self::MESSAGE_EXTENSION, self::MESSAGE_EXTENSION ],
-                    $file
-                );
+            // Rename to .message
+            $originalFile = str_replace(
+                self::PROCESSING_EXTENSION,
+                self::MESSAGE_EXTENSION,
+                $file
+            );
 
-                // Retry allowed → put back to queue
-                @rename($file, $originalFile);
-            } else {
-                // No retry → delete
-                @unlink($file);
+            // Retry allowed → put back to queue
+            @rename($file, $originalFile);
+        }
+    }
+
+    public function total(string $extension = self::MESSAGE_EXTENSION): int {
+        $count = 0;
+        // DirectoryIterator is much faster/lighter than Finder for just counting
+        foreach (new \DirectoryIterator($this->directory) as $file) {
+            if ($file->isDot() || $file->isDir()) continue;
+            if (str_ends_with($file->getFilename(), $extension)) {
+                $count++;
             }
         }
+        return $count;
     }
 
     public function getMessageCount(): int
     {
-        $readyFiles = glob($this->directory . '/*' . self::MESSAGE_EXTENSION);
-        $processingFiles = glob($this->directory . '/*' . self::PROCESSING_EXTENSION);
-
-        return ($readyFiles === false ? 0 : count($readyFiles))
-            + ($processingFiles === false ? 0 : count($processingFiles));
+        return $this->total() + $this->total(self::PROCESSING_EXTENSION);
     }
 
     public function getFileForEnvelope(Envelope $envelope, string $extension = self::MESSAGE_EXTENSION): ?string
@@ -418,16 +492,6 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
         return file_exists($filename) ? $filename : null;
     }
 
-    public function generateUniqueId(): string
-    {
-        do {
-            $id = uniqid(date('Ymd_His_') . gettimeofday()['usec'], true);
-            $fileName = $this->generateFilenameById($id);
-        } while (file_exists($fileName));
-
-        return $id;
-    }
-
     public function generateFilenameById(string $id, string $extension = self::MESSAGE_EXTENSION): string
     {
         return $this->directory . '/' . $id . $extension;
@@ -436,5 +500,21 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     public function getProcessingFilename(string $originalFilename): string
     {
         return str_replace(self::MESSAGE_EXTENSION, self::PROCESSING_EXTENSION, $originalFilename);
+    }
+
+    /**
+     * FS-safe random string generator (identical to Mautic 4 Swift queue)
+     */
+    protected function getRandomString(int $count = 10): string
+    {
+        // This string MUST stay FS safe, avoid special chars
+        $base = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
+        $ret = '';
+        $strlen = \strlen($base);
+        for ($i = 0; $i < $count; ++$i) {
+            $ret .= $base[random_int(0, $strlen - 1)];
+        }
+
+        return $ret;
     }
 }
