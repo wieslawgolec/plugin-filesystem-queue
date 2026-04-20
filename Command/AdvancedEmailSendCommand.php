@@ -35,6 +35,7 @@ class AdvancedEmailSendCommand extends ModeratedCommand
 {
     public const MAX_MESSAGES_PER_THREAD = 50000;
 
+    public const MIN_MESSAGES_PER_THREAD = 300;
     private int $processedSinceLastAck = 0;
     private int $lastAckTime = 0;
     private array $acks = [];
@@ -81,6 +82,9 @@ class AdvancedEmailSendCommand extends ModeratedCommand
             ->addOption('--lock-name', null, InputOption::VALUE_OPTIONAL, 'Custom lock (override auto-generated lock name')
             ->addOption('--max-messages-per-thread', null, InputOption::VALUE_REQUIRED, 'Max messages this thread should process', (string) self::MAX_MESSAGES_PER_THREAD)
             ->addOption('--benchmark', null, InputOption::VALUE_NONE, 'Show performance stats')
+            ->addOption('--recover-stuck', null, InputOption::VALUE_NONE, 'Recover stuck .processing files (file transport only)')
+            ->addOption('--recover-timeout', null, InputOption::VALUE_OPTIONAL, 'Sets the amount of time in seconds before attempting to resend failed messages.  Defaults to value set in config.', 1800)
+
             ->setHelp(<<<'EOT'
 Advanced email sender with multi-threading support.
 
@@ -98,6 +102,10 @@ EOT
         $thread       = max(1, (int) $input->getOption('thread'));
         $maxThreads   = max(1, (int) $input->getOption('max-threads'));
         $maxPerThread = max(1, (int) $input->getOption('max-messages-per-thread'));
+        $recoverStuck  = (bool) $input->getOption('recover-stuck');
+        $recoverTimeout  = $input->getOption('recover-timeout') !== null
+            ? (int) $input->getOption('recover-timeout')
+            : $this->coreParametersHelper->get('mautic.filesystem_queue_recovery_timeout', 1800);
 
         if ($thread > $maxThreads) {
             $output->writeln('<error>--thread cannot exceed --max-threads</error>');
@@ -118,14 +126,14 @@ EOT
         }
 
         // Thread based lock (unless --lock-name was forced)
-        $lockName = $input->getOption('lock-name') ?: sprintf('mautic-queue-email-thread-%d-of-%d', $thread, $maxThreads);
+        $lockName = $input->getOption('lock-name') ?: sprintf('%d-%d', $thread, $maxThreads);
 
         if (!$this->checkRunStatus($input, $output, $lockName)) {
             return Command::SUCCESS;
         }
 
         // ← Add recovery here — only the thread that acquired the lock does it
-        $this->recoverStuckProcessingFiles($output);
+        $this->recoverStuckProcessingFiles($output, $recoverStuck, $recoverTimeout);
 
         $globalMsgLimit = (int) ($input->getOption('message-limit') ?: $this->coreParametersHelper->get('mautic.filesystem_queue_email_msg_limit') ?? 0);
         $timeLimit      = (int) ($input->getOption('time-limit')   ?: $this->coreParametersHelper->get('mautic.filesystem_queue_email_time_limit') ?? 0);
@@ -157,11 +165,10 @@ EOT
             ));
         }
 
-        $maxLoad = min(self::MAX_MESSAGES_PER_THREAD, max(1, $maxPerThread));
         if ($isFsTransport) {
-            $processed += $this->processFilesystemOptimized($transport, $input, $output, $globalMsgLimit, $timeLimit, $memoryLimit, $ackBatchSize, $startTime, $maxPerThread, $maxLoad);
+            $processed += $this->processFilesystemOptimized($transport, $input, $output, $globalMsgLimit, $timeLimit, $memoryLimit, $ackBatchSize, $startTime, $maxPerThread);
         } else {
-            $processed += $this->processStandardGetLoop($transport, $output, $globalMsgLimit, $timeLimit, $memoryLimit, $ackBatchSize, $startTime, $maxPerThread, $maxLoad);
+            $processed += $this->processStandardGetLoop($transport, $output, $globalMsgLimit, $timeLimit, $memoryLimit, $ackBatchSize, $startTime, $maxPerThread);
         }
 
         $this->ackAll($transport);
@@ -196,74 +203,95 @@ EOT
         ?int $memoryLimit,
         int $ackBatchSize,
         int $startTime,
-        int $maxPerThread,
-        int $maxLoad
+        int $maxPerThread
     ): int {
         $processed = 0;
 
-        $ids = $this->listMessageIds($maxLoad);
-        sort($ids);
+        // Get Total Number (for offset calculation)
+        $total = $transport->total();
 
-        $total     = count($ids);
-        $maxThreads = (int) $input->getOption('max-threads');
-        $thread     = (int) $input->getOption('thread');
-        $chunkSize = (int) ceil($total / $maxThreads);
-        $offset    = ($thread - 1) * $chunkSize;
-        $myIds     = array_slice($ids, $offset, $chunkSize);
-
-        if ($maxPerThread > 0) {
-            $myIds = array_slice($myIds, 0, $maxPerThread);
-        }
-
-        if (empty($myIds) && !$output->isQuiet()) {
+        if ($total < 1 && !$output->isQuiet()) {
             $output->writeln('<info>No messages assigned to this thread.</info>');
         }
 
-        foreach ($myIds as $id) {
-            if ($memoryLimit && memory_get_usage(true) > $memoryLimit) break;
-            if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
-            if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
+        if($total > 0) {
+            if ($total <= self::MIN_MESSAGES_PER_THREAD) {
+                $offset = 0;
+                $chunkSize = self::MIN_MESSAGES_PER_THREAD;
+            } else {
+                $maxThreads = (int)$input->getOption('max-threads');
+                $thread = (int)$input->getOption('thread');
+                $chunkSize = (int)ceil($total / $maxThreads);
+                $offset = ($thread - 1) * $chunkSize;
 
-            $filename = $transport->generateFilenameById($id); // .message file
+                if ($chunkSize < self::MIN_MESSAGES_PER_THREAD) {
+                    $chunkSize = self::MIN_MESSAGES_PER_THREAD;
 
-            $lockedFp = $this->tryClaimFile($transport, $filename);
-            if ($lockedFp === false) {
-                if ($output->isVerbose()) {
-                    $output->writeln("<comment>Already claimed or missing: $id</comment>");
-                }
-                continue;
-            }
+                    // make sure chunk size match (if its not lower because of offset is too high)
+                    if ($offset + $chunkSize > $total) {
+                        $offset = $total - $chunkSize;
 
-            $processingFile = $transport->getProcessingFilename($filename);
-
-            $envelope = $this->loadEnvelopeFromFile($processingFile, $id);
-            if (!$envelope) {
-                // load failed → immediate cleanup + delete file
-                if (is_resource($lockedFp)) {
-                    @flock($lockedFp, LOCK_UN);
-                    @fclose($lockedFp);
+                        if ($offset < 0) {
+                            $offset = 0;
+                        }
+                    }
                 }
 
-                // we leave processing file there. it will be recovered to try again later
-                continue;
-            }
-
-            try {
-                $processed++;
-                $this->handleMessage($envelope, $output, $lockedFp);
-            } catch (\Throwable $e) {
-                if ($output->isVerbose()) {
-                    $output->writeln("<error>$id failed: {$e->getMessage()}</error>");
+                if ($maxPerThread > 0 && $chunkSize > $maxPerThread) {
+                    $chunkSize = $maxPerThread;
                 }
-                // Still add to acks so reject + unlock happens in ackAll
-                $this->acks[] = [$envelope, $e, $lockedFp];
             }
 
-            if(($processed > $ackBatchSize && $this->processedSinceLastAck > 0) ||
-                $this->processedSinceLastAck >= $ackBatchSize ||
-                (time() - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
+            // Stream Ids
+            $generator = $transport->listMessageIdsGenerator();
+            $ids = new \LimitIterator(new \IteratorIterator($generator), $offset, $chunkSize);
 
-                $this->ackAll($transport);
+            foreach ($ids as $id) {
+                if ($memoryLimit && memory_get_usage(true) > $memoryLimit) break;
+                if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
+                if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
+
+                $filename = $transport->generateFilenameById($id); // .message file
+
+                $lockedFp = $this->tryClaimFile($transport, $filename);
+                if ($lockedFp === false) {
+                    if ($output->isVerbose()) {
+                        $output->writeln("<comment>Already claimed or missing: $id</comment>");
+                    }
+                    continue;
+                }
+
+                $processingFile = $transport->getProcessingFilename($filename);
+
+                $envelope = $this->loadEnvelopeFromFile($processingFile, $id);
+                if (!$envelope) {
+                    // load failed → immediate cleanup + delete file
+                    if (is_resource($lockedFp)) {
+                        @flock($lockedFp, LOCK_UN);
+                        @fclose($lockedFp);
+                    }
+
+                    // we leave processing file there. it will be recovered to try again later
+                    continue;
+                }
+
+                try {
+                    $processed++;
+                    $this->handleMessage($envelope, $output, $lockedFp);
+                } catch (\Throwable $e) {
+                    if ($output->isVerbose()) {
+                        $output->writeln("<error>$id failed: {$e->getMessage()}</error>");
+                    }
+                    // Still add to acks so reject + unlock happens in ackAll
+                    $this->acks[] = [$envelope, $e, $lockedFp];
+                }
+
+                if (($processed > $ackBatchSize && $this->processedSinceLastAck > 0) ||
+                    $this->processedSinceLastAck >= $ackBatchSize ||
+                    (time() - $this->lastAckTime >= self::ACK_MAX_AGE_SECONDS)) {
+
+                    $this->ackAll($transport);
+                }
             }
         }
 
@@ -278,8 +306,7 @@ EOT
         ?int $memoryLimit,
         int $ackBatchSize,
         int $startTime,
-        int $maxPerThread,
-        int $maxLoad
+        int $maxPerThread
     ): int {
         $processed = 0;
 
@@ -288,7 +315,6 @@ EOT
             if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
             if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
             if ($maxPerThread > 0 && $processed >= $maxPerThread) break;
-            if ($maxLoad > 0 && $processed >= $maxLoad) break;
 
             $envelopes = $transport->get();
             if (empty($envelopes)) {
@@ -317,7 +343,6 @@ EOT
                 if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break 2;
                 if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break 2;
                 if ($maxPerThread > 0 && $processed >= $maxPerThread) break 2;
-                if ($maxLoad > 0 && $processed >= $maxLoad) break 2;
 
                 // Periodically ack & release memory if processed > ackBatchSize
                 if($processed > $ackBatchSize && $this->processedSinceLastAck > 0) {
@@ -335,61 +360,22 @@ EOT
         return $processed;
     }
 
-    private function listMessageIds(int $maxLoad = 0): array
-    {
-        if (!is_dir($this->queueDirectory)) {
-            return [];
-        }
-
-        $finder = Finder::create()
-            ->in($this->queueDirectory)
-            ->name('*' . FileSystemTransport::MESSAGE_EXTENSION);
-            //->sortByName();   // oldest first (like transport when !autoShuffle)
-
-        $ids = [];
-
-        foreach ($finder as $fileInfo) {
-            try {
-                $id = $fileInfo->getBasename(FileSystemTransport::MESSAGE_EXTENSION);
-                $ids[] = $id;
-
-                if ($maxLoad > 0 && count($ids) >= $maxLoad) {
-                    break;
-                }
-            } catch (\Throwable) {
-                // ignore
-            }
-        }
-
-        return $ids;
-    }
 
     /**
      * Recover stuck .processing files — similar logic as FileSystemTransport
      */
-    private function recoverStuckProcessingFiles(OutputInterface $output): void
+    private function recoverStuckProcessingFiles(OutputInterface $output, bool $recoverStuck = false, int $recoverTimeout = 1800): void
     {
-        $timeout = (int) $this->coreParametersHelper->get(
-            'mautic.messenger_retry_strategy_delay',
-            2700  // 45 min
-        );
-
-        $maxRetries = (int) $this->coreParametersHelper->get(
-            'mautic.messenger_retry_strategy_max_retries',
-            0     // 0 = delete, >0 = put back to queue
-        );
-
-        if ($timeout <= 0) {
+        if($recoverStuck === false || $recoverTimeout <= 0) {
             return; // feature disabled
         }
 
         $finder = Finder::create()
             ->in($this->queueDirectory)
             ->name([
-                '*' . FileSystemTransport::MESSAGE_EXTENSION,
-                '*' . FileSystemTransport::TRYAGAIN_EXTENSION
+                '*' . FileSystemTransport::PROCESSING_EXTENSION
             ])
-            ->date('before ' . $timeout . ' seconds ago');
+            ->date('before ' . $recoverTimeout . ' seconds ago');
 
         $recovered = 0;
         foreach ($finder as $fileInfo) {
@@ -405,7 +391,7 @@ EOT
                 $ctime = filectime($file);
 
                 // Double-check age after getting ctime
-                if ((time() - $ctime) <= $timeout) {
+                if ((time() - $ctime) <= $recoverTimeout) {
                     continue;
                 }
 
@@ -421,7 +407,7 @@ EOT
                 // Re-check age after acquiring lock (race condition protection)
                 clearstatcache(true, $file);
                 $ctime = filectime($file);
-                if ((time() - $ctime) <= $timeout) {
+                if ((time() - $ctime) <= $recoverTimeout) {
                     throw new TransportException('File not match recovery time criteria');
                 }
 
@@ -432,14 +418,9 @@ EOT
                     $file
                 );
 
-                if ($maxRetries > 0) {
-                    // Put back to queue for retry
-                    @rename($file, $originalFile);
-                    $recovered++;
-                } else {
-                    // Delete permanently
-                    @unlink($file);
-                }
+                // Put back to queue for retry
+                @rename($file, $originalFile);
+                $recovered++;
             } catch(\Throwable) {
                 if (is_resource($fp)) {
                     @flock($fp, LOCK_UN);
