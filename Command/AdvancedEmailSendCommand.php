@@ -158,7 +158,7 @@ EOT
         if (!$quiet) {
             $output->writeln(sprintf(
                 '<info>Mode: %s (thread %d/%d, max per thread: %d)</info>',
-                $isFsTransport ? 'Optimized filesystem (filename scan + atomic claim)' : 'Standard transport get() loop',
+                $isFsTransport ? 'Optimized filesystem' : 'Standard transport',
                 $thread,
                 $maxThreads,
                 $maxPerThread
@@ -206,6 +206,7 @@ EOT
         int $maxPerThread
     ): int {
         $processed = 0;
+        $offset = 0;
 
         // Get Total Number (for offset calculation)
         $total = $transport->total();
@@ -215,47 +216,29 @@ EOT
         }
 
         if($total > 0) {
-            if ($total <= self::MIN_MESSAGES_PER_THREAD) {
-                $offset = 0;
-                $chunkSize = self::MIN_MESSAGES_PER_THREAD;
-            } else {
+            $thread = (int)$input->getOption('thread');
+            // offset is only required in 2nd+ thread (so we dont start in same place)
+            if ($thread > 1 && $total > self::MIN_MESSAGES_PER_THREAD) {
                 $maxThreads = (int)$input->getOption('max-threads');
-                $thread = (int)$input->getOption('thread');
                 $chunkSize = (int)ceil($total / $maxThreads);
                 $offset = ($thread - 1) * $chunkSize;
-
-                if ($chunkSize < self::MIN_MESSAGES_PER_THREAD) {
-                    $chunkSize = self::MIN_MESSAGES_PER_THREAD;
-
-                    // make sure chunk size match (if its not lower because of offset is too high)
-                    if ($offset + $chunkSize > $total) {
-                        $offset = $total - $chunkSize;
-
-                        if ($offset < 0) {
-                            $offset = 0;
-                        }
-                    }
-                }
-
-                if ($maxPerThread > 0 && $chunkSize > $maxPerThread) {
-                    $chunkSize = $maxPerThread;
-                }
             }
 
             // Stream Ids
             $generator = $transport->listMessageIdsGenerator();
-            $ids = new \LimitIterator(new \IteratorIterator($generator), $offset, $chunkSize);
+            $ids = new \LimitIterator(new \IteratorIterator($generator), $offset);
 
             foreach ($ids as $id) {
                 if ($memoryLimit && memory_get_usage(true) > $memoryLimit) break;
                 if ($globalMsgLimit > 0 && $processed >= $globalMsgLimit) break;
                 if ($timeLimit > 0 && (time() - $startTime) >= $timeLimit) break;
+                if ($maxPerThread > 0 && $processed >= $maxPerThread) break;
 
                 $filename = $transport->generateFilenameById($id); // .message file
 
                 $lockedFp = $this->tryClaimFile($transport, $filename);
                 if ($lockedFp === false) {
-                    if ($output->isVerbose()) {
+                    if ($output->isDebug() && $output->isVeryVerbose()) {
                         $output->writeln("<comment>Already claimed or missing: $id</comment>");
                     }
                     continue;
@@ -359,7 +342,6 @@ EOT
 
         return $processed;
     }
-
 
     /**
      * Recover stuck .processing files — similar logic as FileSystemTransport
