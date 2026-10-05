@@ -1,17 +1,25 @@
 <?php
-// File: plugins/FileSystemQeueueBundle/Config/config.php
 
 return [
     'name'        => 'File System Queue Bundle',
-    'description' => 'Provides filesystem transport for queues + commands to consume it in legacy Mautic 4 way',
-    'version'     => '1.0.0',
+    'description' => 'Filesystem transport for Mautic 7 queues with Mautic-4 style retry state machine',
+    'version'     => '1.1.0',
     'author'      => 'Wieslaw Golec',
+
     'parameters' => [
+        // Existing
         'filesystem_queue_batch_size'         => 1,
-        'filesystem_queue_recovery_interval'  => 30,
-        'filesystem_queue_recovery_stuck'     => true,
-        'filesystem_queue_recovery_timeout'   => 3600,
         'filesystem_queue_batch_auto_shuffle' => true,
+
+        // Retry / recovery (new)
+        'filesystem_queue_max_attempts'        => 5,
+        'filesystem_queue_recovery_timeout'    => 300,   // seconds before stuck .processing is reclaimed
+        'filesystem_queue_recovery_interval'   => 30,    // how often recovery runs
+        'filesystem_queue_recovery_stuck'      => true,
+        'filesystem_queue_retry_backoff_base'  => 30,    // seconds, exponential
+        'filesystem_queue_send_max_retries'    => 15,
+
+        // Existing limits
         'filesystem_queue_msg_limit'          => null,
         'filesystem_queue_time_limit'         => null,
         'filesystem_queue_email_msg_limit'    => null,

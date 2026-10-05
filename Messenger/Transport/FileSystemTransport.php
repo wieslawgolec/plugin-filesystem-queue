@@ -1,163 +1,156 @@
 <?php
 
+declare(strict_types=1);
+
 namespace MauticPlugin\FileSystemQueueBundle\Messenger\Transport;
 
 use Mautic\CoreBundle\Helper\CoreParametersHelper;
-use Mautic\CoreBundle\Helper\PathsHelper;
-use Symfony\Component\Messenger\Envelope;
+use MauticPlugin\FileSystemQueueBundle\Messenger\Stamp\AttemptStamp;
 use Symfony\Component\Finder\Finder;
+use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Transport\Receiver\KeepaliveReceiverInterface;
+use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
+use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
-use Symfony\Component\Messenger\Exception\TransportException;
-use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
-use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
-use Symfony\Component\Messenger\Transport\Receiver\KeepaliveReceiverInterface;
-use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
-class FileSystemTransport implements ListableReceiverInterface,TransportInterface, MessageCountAwareInterface, KeepaliveReceiverInterface
+/**
+ * Filesystem transport with Mautic-4 style state machine:
+ *
+ *   {id}.message                  – pending (attempt 0)
+ *   {id}.message.retry.N          – pending after N failures
+ *   {id}.processing               – claimed (attempt 0)
+ *   {id}.processing.retry.N       – claimed (attempt N)
+ *
+ * Temporary failure  → rename back to .message.retry.N  (middleware forces ack)
+ * Final failure      → reject() deletes file → Messenger sends to failed transport
+ */
+class FileSystemTransport implements
+    TransportInterface,
+    ListableReceiverInterface,
+    MessageCountAwareInterface,
+    KeepaliveReceiverInterface
 {
     public const MESSAGE_EXTENSION    = '.message';
     public const PROCESSING_EXTENSION = '.processing';
-
-    public const SEND_MAX_RETRIES     = 10;
+    public const RETRY_SUFFIX         = '.retry.';
+    public const SEND_MAX_RETRIES     = 15;
 
     private SerializerInterface $serializer;
     private string $directory;
-    private ?int $lastRecoveryTime     = null;   // timestamp of last recovery run
+    private ?int $lastRecoveryTime = null;
 
     public function __construct(
         string $directory,
-        SerializerInterface $serializer = null,
+        ?SerializerInterface $serializer,
         private CoreParametersHelper $coreParametersHelper,
-        protected PathsHelper $pathsHelper,
     ) {
-        $this->directory   = rtrim($directory, '/');
-
-        $this->serializer  = $serializer ?? new PhpSerializer();
+        $this->directory  = rtrim($directory, '/');
+        $this->serializer = $serializer ?? new PhpSerializer();
     }
 
     public function getDirectory(): string
     {
         return $this->directory;
     }
-    
-    public function getSerializer(): SerializerInterface 
+
+    public function getSerializer(): SerializerInterface
     {
         return $this->serializer;
-    }    
+    }
+
+    // -------------------------------------------------------------------------
+    // Producer
+    // -------------------------------------------------------------------------
 
     public function send(Envelope $envelope): Envelope
     {
+        $attempt = $envelope->last(AttemptStamp::class)?->attempt ?? 0;
+        $envelope = $this->withAttempt($envelope, $attempt);
+
         $serialized = $this->serializer->encode($envelope);
-        $jsonData = json_encode($serialized);
-        if ($jsonData === false) {
-            throw new TransportException('Non-retryable file error in send: Failed to JSON-encode the envelope for filesystem queue.');
-        }
+        $jsonData   = json_encode($serialized, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
 
-        // Generate file name (datetime with microsec + random string
-        // It should be unique with single attempt as it include microsecs with 6 digits
-        // 2026-04-20 15:59:59.123456 => 20260420155959123456
-        $id = date("YmdHis") . substr((string)microtime(), 2, 6).'.'.$this->getRandomString();
-        $fileName = $this->generateFilenameById($id);
+        $id       = $this->generateUniqueId();
+        $fileName = $this->buildReadyFilename($id, $attempt);
+        $tmpName  = $fileName . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
 
-        $maxRetries = self::SEND_MAX_RETRIES;
-        $i = 0;
+        $maxRetries = max(5, (int) $this->coreParametersHelper->get(
+            'mautic.filesystem_queue_send_max_retries',
+            self::SEND_MAX_RETRIES
+        ));
 
-        do {
-            /* We try an exclusive creation of the file. This is an atomic operation, it avoid locking mechanism */
-            $fp = @fopen($fileName, 'xb');
-            if (false !== $fp) {
-                if (false === fwrite($fp, $jsonData)) {
-                    throw new TransportException("Non-retryable file error in send: Write failed: $fileName", 0);
+        $lastError = null;
+
+        for ($i = 0; $i < $maxRetries; ++$i) {
+            try {
+                $fp = @fopen($tmpName, 'wb');
+                if ($fp === false) {
+                    throw new TransportException("Cannot open temp file: $tmpName");
                 }
+
+                $written = fwrite($fp, $jsonData);
                 fclose($fp);
 
+                if ($written === false || $written !== strlen($jsonData)) {
+                    @unlink($tmpName);
+                    throw new TransportException("Incomplete write: $tmpName");
+                }
+
+                if (!@rename($tmpName, $fileName)) {
+                    @unlink($tmpName);
+                    // collision – new id
+                    $id       = $this->generateUniqueId();
+                    $fileName = $this->buildReadyFilename($id, $attempt);
+                    $tmpName  = $fileName . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+                    usleep(random_int(50, 300) * 1000);
+                    continue;
+                }
+
                 return $envelope->with(new TransportMessageIdStamp($id));
+            } catch (\Throwable $e) {
+                $lastError = $e;
+                @unlink($tmpName);
+                usleep((100 + $i * 50) * 1000);
             }
-
-            if(++$i < $maxRetries) {
-                /* The file already exists, we try a longer fileName */
-                $id .= $this->getRandomString(1);
-                $fileName = $this->generateFilenameById($id);
-            } else {
-                break;
-            }
-        } while(true);
-
-        throw new TransportException("Max retries ($maxRetries) exceeded in send: Write falied: $fileName", 0);
-    }
-
-    public function ack(Envelope $envelope): void
-    {
-        $filename = $this->getFileForEnvelope($envelope, self::PROCESSING_EXTENSION);
-
-        if (!$filename || !file_exists($filename)) {
-            return;
         }
 
-        $this->withFileRetry(function () use ($filename) {
-            if (!@unlink($filename)) {
-                throw new TransportException("Unlink failed: $filename");
-            }
-        }, 'ack');
+        throw new TransportException(
+            sprintf('Filesystem send failed after %d attempts: %s', $maxRetries, $lastError?->getMessage() ?? 'unknown'),
+            0,
+            $lastError
+        );
     }
 
-    public function reject(Envelope $envelope): void
-    {
-        $filename = $this->getFileForEnvelope($envelope, self::PROCESSING_EXTENSION);
-
-        if (!$filename || !file_exists($filename)) {
-            return;
-        }
-
-        $this->withFileRetry(function () use ($filename) {
-            if (!@unlink($filename)) {
-                throw new TransportException("Unlink failed: $filename");
-            }
-        }, 'reject');
-    }
+    // -------------------------------------------------------------------------
+    // Consumer – claim
+    // -------------------------------------------------------------------------
 
     public function get(): iterable
     {
-        $intervalSeconds = max(5, (int) $this->coreParametersHelper->get(
-            'mautic.filesystem_queue_recovery_interval',
-            30   // default: every 30 seconds
-        ));
+        $this->maybeRecoverStuck();
 
-        $recoverStuck = (bool) $this->coreParametersHelper->get(
-            'mautic.filesystem_queue_recovery_stuck',
-            true
-        );
-
-        if($recoverStuck === true) {
-            $now = time();
-
-            if ($this->lastRecoveryTime === null || ($now - $this->lastRecoveryTime) >= $intervalSeconds) {
-                $this->recoverStuckProcessingFiles();
-                $this->lastRecoveryTime = $now;
-            }
-        }
-
-        $batchSize = max(1, (int) $this->coreParametersHelper->get(
-            'mautic.filesystem_queue_batch_size',
-            1
-        ));
-
+        $batchSize   = max(1, (int) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_size', 1));
         $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
 
-        $offset = $autoShuffle === false ? 0 : rand(0, max(0, $this->total() - 1));
-        $files = new \LimitIterator(new \IteratorIterator($this->listMessageIdsGenerator()), $offset);
+        $ids = iterator_to_array($this->listReadyIds());
+        if ($ids === []) {
+            return [];
+        }
+
+        if ($autoShuffle) {
+            shuffle($ids);
+        }
 
         $envelopes = [];
-
-        foreach ($files as $filename) {
+        foreach ($ids as $id) {
             if (count($envelopes) >= $batchSize) {
                 break;
             }
-
-            $envelope = $this->tryProcessFile($filename);
-
+            $envelope = $this->tryClaim($id);
             if ($envelope !== null) {
                 $envelopes[] = $envelope;
             }
@@ -167,354 +160,391 @@ class FileSystemTransport implements ListableReceiverInterface,TransportInterfac
     }
 
     /**
-     * Refreshes mtime on .processing file WITHOUT using touch() and without ever creating files.
-     * $seconds parameter is accepted but ignored (filesystem uses filectime + configured timeout).
+     * Atomic claim of one ready message.
      */
+    public function tryClaim(string $id): ?Envelope
+    {
+        $readyFiles = glob($this->directory . '/' . $id . '.message*') ?: [];
+        // Ignore temp files
+        $readyFiles = array_values(array_filter(
+            $readyFiles,
+            static fn (string $f) => !str_contains(basename($f), '.tmp.')
+        ));
+
+        if ($readyFiles === []) {
+            return null;
+        }
+
+        // Prefer highest attempt number if multiple somehow exist
+        usort($readyFiles, fn ($a, $b) => $this->extractAttemptFromFilename($b) <=> $this->extractAttemptFromFilename($a));
+        $readyFile = $readyFiles[0];
+
+        // Honour back-off (future mtime)
+        $mtime = filemtime($readyFile) ?: 0;
+        if ($mtime > time()) {
+            return null;
+        }
+
+        $attempt        = $this->extractAttemptFromFilename($readyFile);
+        $processingFile = $this->buildProcessingFilename($id, $attempt);
+
+        if (!@rename($readyFile, $processingFile)) {
+            return null; // lost race
+        }
+
+        try {
+            $content = file_get_contents($processingFile);
+            if ($content === false || $content === '') {
+                @unlink($processingFile);
+                return null;
+            }
+
+            $data = json_decode($content, true);
+            if (!is_array($data)) {
+                @unlink($processingFile);
+                return null;
+            }
+
+            $envelope = $this->serializer->decode($data);
+            $envelope = $this->withAttempt($envelope, $attempt);
+            $envelope = $envelope->with(new TransportMessageIdStamp($id));
+
+            return $envelope;
+        } catch (\Throwable) {
+            // Leave .processing for recovery
+            return null;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ack / reject
+    // -------------------------------------------------------------------------
+
+    public function ack(Envelope $envelope): void
+    {
+        // After a temporary-failure rename the processing file is already gone → no-op.
+        $this->deleteProcessingFiles($envelope);
+    }
+
+    public function reject(Envelope $envelope): void
+    {
+        // Final failure only – delete so Messenger can move the envelope to failed transport.
+        $this->deleteProcessingFiles($envelope);
+    }
+
+    // -------------------------------------------------------------------------
+    // Temporary re-queue (called from middleware – NEVER from reject)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Rename current processing file back to a ready file with incremented attempt.
+     * No new envelope is created → no duplication.
+     */
+    public function requeueWithRetry(Envelope $envelope, int $nextAttempt): void
+    {
+        $id = $this->getIdFromEnvelope($envelope);
+        if ($id === null) {
+            return;
+        }
+
+        $processingFiles = glob($this->directory . '/' . $id . '.processing*') ?: [];
+        if ($processingFiles === []) {
+            return;
+        }
+        $processingFile = $processingFiles[0];
+
+        $max         = $this->getMaxAttempts();
+        $nextAttempt = min(max(1, $nextAttempt), $max);
+
+        $readyFile = $this->buildReadyFilename($id, $nextAttempt);
+
+        // Never create a second ready file for the same id
+        $existingReady = glob($this->directory . '/' . $id . '.message*') ?: [];
+        $existingReady = array_values(array_filter(
+            $existingReady,
+            static fn (string $f) => !str_contains(basename($f), '.tmp.')
+        ));
+        if ($existingReady !== []) {
+            @unlink($processingFile);
+            return;
+        }
+
+        if (!@rename($processingFile, $readyFile)) {
+            @unlink($processingFile);
+            return;
+        }
+
+        $this->applyBackoff($readyFile, $nextAttempt);
+    }
+
+    // -------------------------------------------------------------------------
+    // Recovery
+    // -------------------------------------------------------------------------
+
+    public function recoverStuckProcessingFiles(): void
+    {
+        $timeout = $this->getRecoveryTimeout();
+        $now     = time();
+        $dir     = $this->directory;
+
+        $files = array_merge(
+            glob($dir . '/*.processing') ?: [],
+            glob($dir . '/*.processing.retry.*') ?: []
+        );
+
+        foreach ($files as $file) {
+            $mtime = filemtime($file) ?: 0;
+            if (($now - $mtime) < $timeout) {
+                continue;
+            }
+
+            $baseName = basename($file);
+            $id       = preg_replace('/\.processing.*$/', '', $baseName);
+            $attempt  = $this->extractAttemptFromFilename($file);
+
+            // Already a ready version? just drop the stuck processing file
+            $existingReady = glob($dir . '/' . $id . '.message*') ?: [];
+            $existingReady = array_values(array_filter(
+                $existingReady,
+                static fn (string $f) => !str_contains(basename($f), '.tmp.')
+            ));
+            if ($existingReady !== []) {
+                @unlink($file);
+                continue;
+            }
+
+            $ready = $this->buildReadyFilename($id, $attempt);
+            @rename($file, $ready);
+            // Do not apply extra back-off – original failure already did
+        }
+    }
+
+    private function maybeRecoverStuck(): void
+    {
+        $recover = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_recovery_stuck', true);
+        if (!$recover) {
+            return;
+        }
+
+        $interval = max(5, (int) $this->coreParametersHelper->get('mautic.filesystem_queue_recovery_interval', 30));
+        $now      = time();
+
+        if ($this->lastRecoveryTime === null || ($now - $this->lastRecoveryTime) >= $interval) {
+            $this->recoverStuckProcessingFiles();
+            $this->lastRecoveryTime = $now;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Keepalive / list / count
+    // -------------------------------------------------------------------------
+
     public function keepalive(Envelope $envelope, ?int $seconds = null): void
     {
-        $filename = $this->getFileForEnvelope($envelope, self::PROCESSING_EXTENSION);
-
-        if (!$filename || !file_exists($filename)) {
+        $id = $this->getIdFromEnvelope($envelope);
+        if ($id === null) {
             return;
         }
-
-        $this->withFileRetry(static function () use ($filename): void {
-            // Double-check inside retry block (protects against race)
-            if (!file_exists($filename)) {
-                return;
+        $files = glob($this->directory . '/' . $id . '.processing*') ?: [];
+        foreach ($files as $file) {
+            if (!file_exists($file)) {
+                continue;
             }
-
-            $fp = @fopen($filename, 'r+');
-            if (false === $fp) {
-                throw new TransportException(sprintf('Unable to open keepalive file for update "%s".', $filename));
-            }
-
-            // Minimal operation that forces mtime update without changing content
-            // ftruncate + fwrite(0 bytes) or even just fclose() after open is enough on most FS
-            if (false === @ftruncate($fp, 0)) {
-                @fclose($fp);
-                throw new TransportException(sprintf('Unable to truncate keepalive file "%s".', $filename));
-            }
-
-            if (false === @fclose($fp)) {
-                throw new TransportException(sprintf('Unable to close keepalive file "%s".', $filename));
-            }
-        }, 'keepalive');
-    }
-
-    /**
-     * Try to process one file with retry protection
-     */
-    public function tryProcessFile(string $filename): ?Envelope
-    {
-        $envelope = null;
-
-        try {
-            $this->withFileRetry(function () use ($filename, &$envelope) {
-                $fp = @fopen($filename, 'r');
-                if ($fp === false) {
-                    throw new TransportException("Open failed: $filename");
-                }
-
-                if (!flock($fp, LOCK_EX | LOCK_NB)) {
-                    throw new TransportException("Lock failed: $filename");
-                }
-
-                $processingFile = $this->getProcessingFilename($filename);
-
-                if (!@rename($filename, $processingFile)) {
-                    flock($fp, LOCK_UN);
-                    fclose($fp);
-                    throw new TransportException("Rename failed: $filename → $processingFile");
-                }
-
-                $content = file_get_contents($processingFile);
-                if ($content === false) {
-                    flock($fp, LOCK_UN);
-                    fclose($fp);
-                    throw new TransportException("Read failed: $processingFile");
-                }
-
-                $data = json_decode($content, true);
-                if ($data === null || $data === false) {
-                    flock($fp, LOCK_UN);
-                    fclose($fp);
-                    throw new TransportException("Invalid JSON: $processingFile");
-                }
-
-                $decoded = $this->serializer->decode($data);
-                $id = basename($filename, self::MESSAGE_EXTENSION);
-                $envelope = $decoded->with(new TransportMessageIdStamp($id));
-
-                flock($fp, LOCK_UN);
+            // Force mtime update without touch() (some FS restrict it)
+            $fp = @fopen($file, 'r+');
+            if ($fp !== false) {
+                @ftruncate($fp, filesize($file) ?: 0);
                 fclose($fp);
-            }, 'get/process file');
-        } catch (TransportException) {
-            // All retryable failures end up here
-            return null;
-        } catch (\Throwable $e) {
-            // Critical / unexpected error — re-throw to stop worker
-            throw $e;
-        }
-
-        return $envelope;
-    }
-
-    /**
-     * Retry helper for transient file operations, using Messenger retry strategy parameters
-     */
-   public function withFileRetry(callable $operation, string $context = 'operation'): void
-    {
-        // Read current strategy from config (exactly your parameters)
-        $maxRetries   = max(0, (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_max_retries', 3));
-        $baseDelayMs  = (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_delay', 1000);
-        $multiplier   = (float) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_multiplier', 2.0);
-        $maxDelayMs   = (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_max_delay', 0);
-
-        $delayMs = $baseDelayMs;
-        $retries = 0;
-
-        retry:
-        try {
-            $operation();
-            return;
-        } catch (\Throwable $e) {
-            // Only retry on errors that look transient
-            if (!$this->isRetryableFileError($e)) {
-                throw new TransportException("Non-retryable file error in $context: " . $e->getMessage(), 0, $e);
             }
-
-            if (++$retries > $maxRetries) {
-                throw new TransportException("Max retries ($maxRetries) exceeded in $context: " . $e->getMessage(), 0, $e);
-            }
-
-            // Exponential backoff + small random jitter
-            $currentDelay = $maxDelayMs > 0 ? min($delayMs, $maxDelayMs) : $delayMs;
-            $jitter = random_int(-50, 50); // ±50 ms
-
-            usleep(($currentDelay + $jitter) * 1000);
-
-            // Next delay = current * multiplier
-            $delayMs = (int) ($delayMs * $multiplier);
-
-            goto retry;
         }
     }
 
-    /**
-     * Decide if error is worth retrying (filesystem transient errors)
-     */
-    public function isRetryableFileError(\Throwable $e): bool
-    {
-        $msg = $e->getMessage();
-
-        // Common transient file errors
-        return str_contains($msg, 'Permission denied') ||
-            str_contains($msg, 'Resource temporarily unavailable') ||
-            str_contains($msg, 'Device or resource busy') ||
-            str_contains($msg, 'No space left') ||
-            str_contains($msg, 'Input/output error') ||
-            $e instanceof \ErrorException && str_contains($msg, 'fopen') && str_contains($msg, 'failed');
-    }
-
-    public function listMessageIdsGenerator(string $extension = self::MESSAGE_EXTENSION): \Generator
-    {
-        $finder = Finder::create()
-            ->in($this->directory)
-            ->name('*' . $extension);
-            //->sortByName();   // oldest first (like transport when !autoShuffle)
-
-        foreach ($finder as $fileInfo) {
-            yield $fileInfo->getBasename($extension);
-        }
-    }
-
-    /**
-     * Returns all ready messages (up to limit) as Envelopes with stamps.
-     */
     public function all(?int $limit = null): iterable
     {
-        $autoShuffle = (bool) $this->coreParametersHelper->get('mautic.filesystem_queue_batch_auto_shuffle', true);
-
-        $offset = ($limit === null || $autoShuffle === false) ? 0 : rand(0, max(0, $this->total() - $limit - 1));
-        $files = new \LimitIterator(new \IteratorIterator($this->listMessageIdsGenerator()), $offset, $limit === null ? -1 : $limit);
-
         $count = 0;
-        foreach ($files as $filename) {
+        foreach ($this->listReadyIds() as $id) {
             if ($limit !== null && $count >= $limit) {
                 break;
             }
-
-            $content = @file_get_contents($filename);
-            if ($content === false) {
-                continue;
-            }
-
-            $data = @json_decode($content, true);
-            if ($data === null || $data === false) {
-                continue;
-            }
-
-            try {
-                $envelope = $this->serializer->decode($data);
-
-                $id = basename($filename, self::MESSAGE_EXTENSION);
-                yield $envelope->with(new TransportMessageIdStamp($id));
-
-                $count++;
-            } catch (\Throwable $e) {
-                // Skip invalid messages - do not throw
-                continue;
+            $envelope = $this->tryClaim($id);
+            if ($envelope !== null) {
+                yield $envelope;
+                ++$count;
             }
         }
     }
 
-    /**
-     * Finds and returns a single message by its ID (TransportMessageIdStamp).
-     * Returns null if not found or invalid.
-     */
     public function find(mixed $id): ?Envelope
     {
-        if (!is_string($id)) {
-            return null;
-        }
-
-        $filename = $this->generateFilenameById($id);
-
-        if (!file_exists($filename)) {
-            // Also check if it's currently processing
-            $processingFile = $this->generateFilenameById($id, self::PROCESSING_EXTENSION);
-            if (!file_exists($processingFile)) {
-                return null;
-            }
-            $filename = $processingFile;
-        }
-
-        $content = @file_get_contents($filename);
-        if ($content === false) {
-            return null;
-        }
-
-        $data = @json_decode($content, true);
-        if ($data === null || $data === false) {
-            return null;
-        }
-
-        try {
-            $envelope = $this->serializer->decode($data);
-            return $envelope->with(new TransportMessageIdStamp($id));
-        } catch (\Throwable $e) {
-            return null;
-        }
-    }
-
-    /**
-     * Recover stuck .processing files based on retry strategy settings
-     */
-    public function recoverStuckProcessingFiles(): void
-    {
-        $timeout = $this->coreParametersHelper->get(
-            'mautic.filesystem_queue_recovery_timeout',
-            3600  // default 1 hour
-        );
-
-        $finder = Finder::create()
-            ->in($this->directory)
-            ->name([
-                '*' . self::PROCESSING_EXTENSION
-            ])
-            ->date('before ' . $timeout . ' seconds ago');
-
-        foreach ($finder as $fileInfo) {
-            $file = $fileInfo->getRealPath();
-
-            $lockedtime = filectime($file);
-            if ((time() - $lockedtime) <= $timeout) {
-                // Not old enough
-                continue;
-            }
-
-            $fp = @fopen($file, 'r+');
-            if (!$fp) {
-                continue;
-            }
-
-            if (!flock($fp, LOCK_EX | LOCK_NB)) {
-                fclose($fp);
-                continue;
-            }
-
-            // Re-check time after lock
-            $lockedtime = filectime($file);
-            if ((time() - $lockedtime) <= $timeout) {
-                flock($fp, LOCK_UN);
-                fclose($fp);
-                continue;
-            }
-
-            // Rename to .message
-            $originalFile = str_replace(
-                self::PROCESSING_EXTENSION,
-                self::MESSAGE_EXTENSION,
-                $file
-            );
-
-            // Retry allowed → put back to queue
-            @rename($file, $originalFile);
-        }
-    }
-
-    public function total(string $extension = self::MESSAGE_EXTENSION): int {
-        $count = 0;
-        // DirectoryIterator is much faster/lighter than Finder for just counting
-        foreach (new \DirectoryIterator($this->directory) as $file) {
-            if ($file->isDot() || $file->isDir()) continue;
-            if (str_ends_with($file->getFilename(), $extension)) {
-                $count++;
-            }
-        }
-        return $count;
+        return $this->tryClaim((string) $id);
     }
 
     public function getMessageCount(): int
     {
-        return $this->total() + $this->total(self::PROCESSING_EXTENSION);
+        return iterator_count($this->listReadyIds());
     }
 
-    public function getFileForEnvelope(Envelope $envelope, string $extension = self::MESSAGE_EXTENSION): ?string
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private function listReadyIds(): \Generator
+    {
+        if (!is_dir($this->directory)) {
+            return;
+        }
+
+        $finder = Finder::create()
+            ->files()
+            ->in($this->directory)
+            ->name('*.message*')
+            ->notName('*.tmp.*');
+
+        $seen = [];
+        foreach ($finder as $fileInfo) {
+            $name = $fileInfo->getFilename();
+            if (!str_contains($name, self::MESSAGE_EXTENSION)) {
+                continue;
+            }
+            $id = preg_replace('/\.message.*$/', '', $name);
+            if ($id === null || $id === '' || isset($seen[$id])) {
+                continue;
+            }
+            $seen[$id] = true;
+            yield $id;
+        }
+    }
+
+    private function deleteProcessingFiles(Envelope $envelope): void
+    {
+        $id = $this->getIdFromEnvelope($envelope);
+        if ($id === null) {
+            return;
+        }
+
+        $matches = glob($this->directory . '/' . $id . '.processing*') ?: [];
+        foreach ($matches as $file) {
+            $this->withFileRetry(
+                static function () use ($file): void {
+                    if (file_exists($file) && !@unlink($file)) {
+                        throw new TransportException("Unlink failed: $file");
+                    }
+                },
+                'delete-processing'
+            );
+        }
+    }
+
+    private function buildReadyFilename(string $id, int $attempt): string
+    {
+        if ($attempt > 0) {
+            return $this->directory . '/' . $id . self::MESSAGE_EXTENSION . self::RETRY_SUFFIX . $attempt;
+        }
+        return $this->directory . '/' . $id . self::MESSAGE_EXTENSION;
+    }
+
+    private function buildProcessingFilename(string $id, int $attempt): string
+    {
+        if ($attempt > 0) {
+            return $this->directory . '/' . $id . self::PROCESSING_EXTENSION . self::RETRY_SUFFIX . $attempt;
+        }
+        return $this->directory . '/' . $id . self::PROCESSING_EXTENSION;
+    }
+
+    private function extractAttemptFromFilename(string $filename): int
+    {
+        if (preg_match('/\.retry\.(\d+)/', basename($filename), $m)) {
+            return min((int) $m[1], $this->getMaxAttempts());
+        }
+        return 0;
+    }
+
+    private function getAttempt(Envelope $envelope): int
+    {
+        $stamp = $envelope->last(AttemptStamp::class);
+        return $stamp instanceof AttemptStamp ? $stamp->attempt : 0;
+    }
+
+    private function withAttempt(Envelope $envelope, int $attempt): Envelope
+    {
+        $envelope = $envelope->withoutAll(AttemptStamp::class);
+        return $envelope->with(new AttemptStamp($attempt));
+    }
+
+    private function getIdFromEnvelope(Envelope $envelope): ?string
     {
         $stamp = $envelope->last(TransportMessageIdStamp::class);
-        if (!$stamp instanceof TransportMessageIdStamp) {
-            throw new \LogicException('No TransportMessageIdStamp found on the Envelope.');
+        return $stamp instanceof TransportMessageIdStamp ? (string) $stamp->getId() : null;
+    }
+
+    private function generateUniqueId(): string
+    {
+        return date('YmdHis')
+            . substr(str_replace('.', '', sprintf('%.6f', microtime(true))), -6)
+            . '.'
+            . bin2hex(random_bytes(4))
+            . '.'
+            . getmypid();
+    }
+
+    private function applyBackoff(string $file, int $attempt): void
+    {
+        $base = $this->getBackoffBase();
+        if ($base <= 0) {
+            return;
         }
-
-        $filename = $this->generateFilenameById($stamp->getId(), $extension);
-        return file_exists($filename) ? $filename : null;
+        $delay  = min($base * (2 ** max(0, $attempt - 1)), 3600);
+        $future = time() + $delay;
+        @touch($file, $future);
     }
 
-    public function generateFilenameById(string $id, string $extension = self::MESSAGE_EXTENSION): string
+    private function getMaxAttempts(): int
     {
-        return $this->directory . '/' . $id . $extension;
+        return max(1, (int) $this->coreParametersHelper->get('mautic.filesystem_queue_max_attempts', 5));
     }
 
-    public function getProcessingFilename(string $originalFilename): string
+    private function getRecoveryTimeout(): int
     {
-        return str_replace(self::MESSAGE_EXTENSION, self::PROCESSING_EXTENSION, $originalFilename);
+        return max(60, (int) $this->coreParametersHelper->get('mautic.filesystem_queue_recovery_timeout', 300));
     }
 
-    /**
-     * FS-safe random string generator (identical to Mautic 4 Swift queue)
-     */
-    protected function getRandomString(int $count = 10): string
+    private function getBackoffBase(): int
     {
-        // This string MUST stay FS safe, avoid special chars
-        $base = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
-        $ret = '';
-        $strlen = \strlen($base);
-        for ($i = 0; $i < $count; ++$i) {
-            $ret .= $base[random_int(0, $strlen - 1)];
+        return max(0, (int) $this->coreParametersHelper->get('mautic.filesystem_queue_retry_backoff_base', 30));
+    }
+
+    public function withFileRetry(callable $operation, string $context = 'operation'): void
+    {
+        $maxRetries  = max(0, (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_max_retries', 3));
+        $baseDelayMs = (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_delay', 1000);
+        $multiplier  = (float) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_multiplier', 2.0);
+        $maxDelayMs  = (int) $this->coreParametersHelper->get('mautic.messenger_retry_strategy_max_delay', 0);
+
+        $delayMs = $baseDelayMs;
+        $retries = 0;
+
+        while (true) {
+            try {
+                $operation();
+                return;
+            } catch (\Throwable $e) {
+                if (!$this->isRetryableFileError($e) || ++$retries > $maxRetries) {
+                    throw new TransportException("File error in $context: " . $e->getMessage(), 0, $e);
+                }
+                $current = $maxDelayMs > 0 ? min($delayMs, $maxDelayMs) : $delayMs;
+                usleep(($current + random_int(-50, 50)) * 1000);
+                $delayMs = (int) ($delayMs * $multiplier);
+            }
         }
+    }
 
-        return $ret;
+    private function isRetryableFileError(\Throwable $e): bool
+    {
+        $msg = $e->getMessage();
+        return str_contains($msg, 'Permission denied')
+            || str_contains($msg, 'Resource temporarily unavailable')
+            || str_contains($msg, 'Device or resource busy')
+            || str_contains($msg, 'No space left')
+            || str_contains($msg, 'Input/output error');
     }
 }
