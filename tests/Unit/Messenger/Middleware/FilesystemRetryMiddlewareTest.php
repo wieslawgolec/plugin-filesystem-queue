@@ -11,6 +11,7 @@ use MauticPlugin\FileSystemQueueBundle\Messenger\Transport\FileSystemTransport;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
 use Symfony\Component\Messenger\Middleware\StackMiddleware;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
@@ -98,7 +99,7 @@ final class FilesystemRetryMiddlewareTest extends TestCase
 
     private function createPassthroughStack(): StackInterface
     {
-        $next = new class {
+        $next = new class implements MiddlewareInterface {
             public function handle(Envelope $envelope, StackInterface $stack): Envelope
             {
                 return $envelope;
@@ -110,8 +111,9 @@ final class FilesystemRetryMiddlewareTest extends TestCase
 
     private function createThrowingStack(\Throwable $e): StackInterface
     {
-        $next = new class($e) {
+        $next = new class($e) implements MiddlewareInterface {
             public function __construct(private \Throwable $e) {}
+
             public function handle(Envelope $envelope, StackInterface $stack): Envelope
             {
                 throw $this->e;
