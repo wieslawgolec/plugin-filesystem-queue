@@ -38,11 +38,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
           restore-keys: ${{ runner.os }}-composer-
 
-      - name: Install dependencies
-        run: composer install --prefer-dist --no-progress --no-interaction --no-scripts
+      - name: Install dependencies (ignore missing mautic/core-lib)
+        run: |
+          # mautic/core-lib is not on public Packagist; provide a stub and
+          # install only the packages needed for unit tests.
+          composer config --no-plugins allow-plugins true || true
+          composer require --dev --no-update --no-interaction \
+            phpunit/phpunit:^11.5 \
+            symfony/messenger:^7.0 \
+            symfony/finder:^7.0 \
+            symfony/http-kernel:^7.0 \
+            symfony/dependency-injection:^7.0
+          # Remove the hard dependency so Composer can resolve without it
+          composer remove --no-update mautic/core-lib || true
+          composer update --prefer-dist --no-progress --no-interaction --no-scripts
 
       - name: Run PHPUnit
         run: vendor/bin/phpunit --colors=always
