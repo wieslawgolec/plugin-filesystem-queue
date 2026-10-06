@@ -108,122 +108,26 @@ Backoff is applied via future `mtime` on the ready file after a temporary failur
 
 All settings are overridable in `app/config/local.php` (e.g. `'filesystem_queue_batch_size' => 50`).
 
-### Batching & limits
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `filesystem_queue_batch_size` | `1` | Messages claimed per `get()` call |
-| `filesystem_queue_batch_auto_shuffle` | `true` | Shuffle ready IDs before claiming |
-| `filesystem_queue_msg_limit` | `null` | Global max messages per consume run |
-| `filesystem_queue_time_limit` | `null` | Global time limit (seconds) per consume run |
-| `filesystem_queue_email_msg_limit` | `null` | Email-queue specific message limit |
-| `filesystem_queue_email_time_limit` | `null` | Email-queue specific time limit |
-| `filesystem_queue_hit_msg_limit` | `null` | Hit-queue specific message limit |
-| `filesystem_queue_hit_time_limit` | `null` | Hit-queue specific time limit |
-| `filesystem_queue_failed_msg_limit` | `null` | Failed-queue specific message limit |
-| `filesystem_queue_failed_time_limit` | `null` | Failed-queue specific time limit |
-
-### Retry & recovery (v1.1)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `filesystem_queue_max_attempts` | `5` | Max attempts before final failure (reject → failed transport) |
-| `filesystem_queue_recovery_timeout` | `300` | Seconds before a stuck `.processing` file is reclaimed |
-| `filesystem_queue_recovery_interval` | `30` | How often recovery runs (seconds) |
-| `filesystem_queue_recovery_stuck` | `true` | Enable stuck-file recovery |
-| `filesystem_queue_retry_backoff_base` | `30` | Base delay (seconds) for exponential backoff (`base * 2^(attempt-1)`, capped at 3600) |
-| `filesystem_queue_send_max_retries` | `15` | Max retries when writing a new message file (collision / FS errors) |
-
-### Supervisor (`mautic:emails:supervisor`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `filesystem_queue_supervisor_initial_threads` | `1` | Starting number of worker processes |
-| `filesystem_queue_supervisor_max_threads` | `8` | Maximum concurrent workers |
-| `filesystem_queue_supervisor_time_limit` | `3600` | Max lifetime (seconds) per thread |
-| `filesystem_queue_supervisor_memory_limit` | `'256M'` | Memory limit per thread |
-| `filesystem_queue_supervisor_email_limit` | `300` | Target emails per thread per cycle |
-| `filesystem_queue_supervisor_settle_time` | `15` | Seconds to wait after start/stop |
-| `filesystem_queue_supervisor_emails_per_extra_thread` | `250` | Expected extra emails per added thread |
-| `filesystem_queue_supervisor_emails_per_second_initial` | `0.8` | Initial assumed send rate |
-| `filesystem_queue_supervisor_rate_smoothing_factor` | `0.3` | Rate smoothing factor (0–1) |
-| `filesystem_queue_supervisor_dynamic_rate_enabled` | `true` | Scale based on observed rate |
-| `filesystem_queue_supervisor_max_messages_per_thread` | `0` | Hard cap per thread (`0` = unlimited) |
-| `filesystem_queue_supervisor_max_server_load` | `4.0` | Max load average before refusing new threads |
-| `filesystem_queue_supervisor_max_memory_usage_percent` | `80` | Max system memory % before scaling down |
-| `filesystem_queue_supervisor_delay_between_threads` | `5` | Delay (seconds) between starting threads |
-| `filesystem_queue_supervisor_max_load_increase` | `0.5` | Max load increase per scaling step |
-| `filesystem_queue_supervisor_max_mem_increase_percent` | `5` | Max memory % increase per step |
-| `filesystem_queue_supervisor_check_interval` | `10` | How often supervisor re-evaluates |
-| `filesystem_queue_supervisor_logging_enabled` | `true` | Log supervisor decisions |
-| `filesystem_queue_supervisor_custom_log_name` | `''` | Custom log name (empty = default in `var/logs/`) |
-| `filesystem_queue_supervisor_benchmark_enabled` | `false` | Enable benchmark metrics in threads |
-| `filesystem_queue_supervisor_verbosity_level` | `0` | Verbosity: 0 / 1 / 2 / 3 |
-| `filesystem_queue_supervisor_check_maintenance_locks` | `false` | Respect Mautic maintenance locks |
+See the full parameter tables in the repository history / docs for batching, retry, recovery, and supervisor settings.
 
 ## Usage
 
 ### Basic queue workers (cron or systemd)
 
 ```bash
-# Email queue – high volume
 * * * * * php /path/to/mautic/bin/console mautic:queue:consume email --no-interaction --limit=100 --time-limit=300 --memory-limit=512M
-
-# Hit queue – lighter load
 * * * * * php /path/to/mautic/bin/console mautic:queue:consume hit --no-interaction --limit=200 --time-limit=120
-
-# Failed queue – occasional retries
 * * * * * php /path/to/mautic/bin/console mautic:queue:consume failed --no-interaction --limit=50 --time-limit=300
 ```
 
 ### Built-in supervisor for emails
 
-Prefer **systemd** / **supervisor** over plain cron for production:
-
 ```bash
-# Foreground (use nohup/screen/systemd in production)
 php bin/console mautic:emails:supervisor
-
-# Verbose + benchmark
 php bin/console mautic:emails:supervisor -vv --benchmark
 ```
 
-The supervisor starts with `initial_threads`, monitors load/memory, and scales up to `max_threads` based on send rate and thresholds. Threads are restarted when they hit time/memory limits.
-
-### Useful flags
-
-- `--benchmark` — messages/sec, total time, peak memory
-- `-v` / `-vv` / `-vvv` — increasing verbosity
-- `--memory-limit=128M` — exit if memory exceeds limit
-- `--limit=500` / `--time-limit=300` — batch/time controls
-
-```bash
-php bin/console mautic:emails:send -v
-php bin/console mautic:emails:send --benchmark --limit=500
-php bin/console mautic:hits:consume --benchmark
-php bin/console mautic:failed:consume --memory-limit=128M
-```
-
-## Monitoring
-
-```bash
-# Ready messages (including retries)
-ls var/queue/email/*.message* 2>/dev/null | wc -l
-
-# Currently processing
-ls var/queue/email/*.processing* 2>/dev/null | wc -l
-
-# Retry backlog only
-ls var/queue/email/*.message.retry.* 2>/dev/null | wc -l
-```
-
-Integrate directory sizes with Prometheus, Zabbix, or similar as needed.
-
 ## Testing
-
-The plugin ships with a PHPUnit suite (unit + concurrent multi-process race tests).
-
-### Run locally
 
 ```bash
 cd plugins/FileSystemQueueBundle
@@ -231,33 +135,16 @@ composer install
 vendor/bin/phpunit
 ```
 
-### What is covered
+CI runs on **PHP 8.2, 8.5, and 8.6**.
 
-- **Unit:** `send` / `tryClaim` / `ack` / `reject` / `requeueWithRetry` / recovery / keepalive / factory / middleware decisions
-- **Concurrency:** parallel workers claiming the same pool (exactly-once), concurrent `send()` uniqueness, requeue + reclaim under contention, interleaved send+claim accounting
+## Support the project
 
-### CI
+If this plugin saves you time, you can support development:
 
-GitHub Actions runs the suite on **PHP 8.2, 8.5, and 8.6** on every push/PR to `mautic7.x` and `feature/**` branches (see `.github/workflows/tests.yml`).
+- **GitHub Sponsors:** [github.com/sponsors/wieslawgolec](https://github.com/sponsors/wieslawgolec)
+- **Buy Me a Coffee:** [buymeacoffee.com/wieslawgolec](https://buymeacoffee.com/wieslawgolec)
 
-> Note: CI installs without the private `mautic/core-lib` package and uses a minimal `CoreParametersHelper` stub. Production always uses the real Mautic class.
-
-## Architecture notes (v1.1)
-
-| Component | Role |
-|-----------|------|
-| `FileSystemTransport` | Producer + consumer; atomic claim; requeue; recovery; keepalive |
-| `FileSystemTransportFactory` | Builds transport from `filesystem://…` DSN under `{projectDir}/var/queue` |
-| `FilesystemRetryMiddleware` | On temporary failure: `requeueWithRetry()` and return (worker acks). On final failure: re-throw (worker rejects → failed transport) |
-| `AttemptStamp` | Carries attempt number on the envelope (mirrors filename state) |
-
-## Troubleshooting
-
-- **"Unsupported scheme" in UI** → Use DSN override in `local.php`
-- **No files appear** → Check `var/logs/`, workers running, DSN path, directory permissions on `var/queue/`
-- **Factory not registered** → `php bin/console debug:container --tag messenger.transport_factory`
-- **Messages stuck in `.processing`** → Recovery will reclaim after `filesystem_queue_recovery_timeout`; ensure `filesystem_queue_recovery_stuck` is `true`
-- **Too many rapid retries** → Increase `filesystem_queue_retry_backoff_base` or lower worker concurrency temporarily
+Use the **Sponsor** button on this repository for the same links.
 
 ## License
 
