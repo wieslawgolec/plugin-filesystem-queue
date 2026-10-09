@@ -144,8 +144,6 @@ If this plugin saves you time, you can support development:
 - **GitHub Sponsors:** [github.com/sponsors/wieslawgolec](https://github.com/sponsors/wieslawgolec)
 - **Buy Me a Coffee:** [buymeacoffee.com/wieslawgolec](https://buymeacoffee.com/wieslawgolec)
 
-Use the **Sponsor** button on this repository for the same links.
-
 ## License
 
 MIT
